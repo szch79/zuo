@@ -138,6 +138,7 @@ typedef enum {
   zuo_integer_tag,
   zuo_string_tag,
   zuo_symbol_tag,
+  zuo_keyword_tag,
   zuo_trie_node_tag,
   zuo_variable_tag,
   zuo_primitive_tag,
@@ -206,6 +207,11 @@ typedef struct {
   zuo_int32_t id;
   zuo_t *str;
 } zuo_symbol_t;
+
+/* A keyword reuses the symbol layout (id + interned string) but has a
+   distinct tag, so `keyword?` is disjoint from `symbol?`. Keywords are
+   interned in their own table and self-evaluate (see the interp loop). */
+typedef zuo_symbol_t zuo_keyword_t;
 
 #define ZUO_TRIE_BFACTOR_BITS 4
 #define ZUO_TRIE_BFACTOR      (1 << ZUO_TRIE_BFACTOR_BITS)
@@ -324,6 +330,7 @@ static struct {
 
     /* symbol table, root environment, and modules */
     zuo_t *o_intern_table;
+    zuo_t *o_keyword_intern_table;
     zuo_t *o_top_env;
     zuo_t *o_modules;
 
@@ -482,6 +489,7 @@ static zuo_int_t object_size(zuo_int32_t tag, zuo_int_t maybe_string_len) {
   case zuo_pair_tag:
     return sizeof(zuo_pair_t);
   case zuo_symbol_tag:
+  case zuo_keyword_tag:
     return sizeof(zuo_symbol_t);
   case zuo_trie_node_tag:
     return sizeof(zuo_trie_node_t);
@@ -532,6 +540,7 @@ static void zuo_trace(zuo_t *obj) {
     zuo_update(&((zuo_pair_t *)obj)->cdr);
     break;
   case zuo_symbol_tag:
+  case zuo_keyword_tag:
     zuo_update(&((zuo_symbol_t *)obj)->str);
     break;
   case zuo_trie_node_tag:
@@ -836,6 +845,7 @@ static void zuo_fasl(zuo_t *obj, zuo_fasl_stream_t *stream) {
     zuo_fasl_ref(&((zuo_pair_t *)obj)->cdr, stream);
     break;
   case zuo_symbol_tag:
+  case zuo_keyword_tag:
     zuo_fasl_int32(&((zuo_symbol_t *)obj)->id, stream);
     zuo_fasl_ref(&((zuo_symbol_t *)obj)->str, stream);
     break;
@@ -1073,23 +1083,32 @@ static zuo_t *zuo_trie_node(void) {
   return (zuo_t *)obj;
 }
 
-static zuo_t *zuo_make_symbol_from_string(zuo_t *str) {
-  zuo_symbol_t *obj = (zuo_symbol_t *)zuo_new(zuo_symbol_tag, sizeof(zuo_symbol_t));
+static zuo_t *zuo_make_tagged_symbol_from_string(zuo_t *str, zuo_int32_t tag) {
+  /* keywords reuse the symbol layout and the shared `zuo_symbol_count`
+     id space, so keyword and symbol ids never collide in id-keyed tries */
+  zuo_symbol_t *obj = (zuo_symbol_t *)zuo_new(tag, sizeof(zuo_symbol_t));
   obj->id = zuo_symbol_count++;
   obj->str = str;
   return (zuo_t *)obj;
+}
+
+static zuo_t *zuo_make_symbol_from_string(zuo_t *str) {
+  return zuo_make_tagged_symbol_from_string(str, zuo_symbol_tag);
 }
 
 static zuo_t *zuo_make_symbol(const char *in_str) {
   return zuo_make_symbol_from_string(zuo_string(in_str));
 }
 
-/* If `str_obj` is undefined, it's allocated as needed.
-   If `str_obj` us false, the result can be false. */
-static zuo_t *zuo_symbol_from_string(const char *in_str, zuo_t *str_obj) {
+/* Shared interning core for symbols and keywords. TABLE_ROOT selects the
+   intern table and TAG the resulting object's type.
+   If `str_obj` is undefined, it's allocated as needed.
+   If `str_obj` is false, the result can be false. */
+static zuo_t *zuo_intern_from_string(const char *in_str, zuo_t *str_obj,
+                                     zuo_t *table_root, zuo_int32_t tag) {
   const unsigned char *str = (const unsigned char *)in_str;
   zuo_int_t i;
-  zuo_trie_node_t *node = (zuo_trie_node_t *)z.o_intern_table;
+  zuo_trie_node_t *node = (zuo_trie_node_t *)table_root;
 
   for (i = 0; str[i]; i++) {
     int c = str[i], lo = c & ZUO_TRIE_BFACTOR_MASK, hi = c >> ZUO_TRIE_BFACTOR_BITS;
@@ -1108,17 +1127,29 @@ static zuo_t *zuo_symbol_from_string(const char *in_str, zuo_t *str_obj) {
     if (str_obj == z.o_false)
       return z.o_false;
     else if (str_obj == z.o_undefined)
-      node->val = zuo_make_symbol(in_str);
+      node->val = zuo_make_tagged_symbol_from_string(zuo_string(in_str), tag);
     else
-      node->val = zuo_make_symbol_from_string(str_obj);
+      node->val = zuo_make_tagged_symbol_from_string(str_obj, tag);
   }
-  /* the symbol table doesn't use the `key` field */
+  /* the intern table doesn't use the `key` field */
 
   return node->val;
 }
 
+static zuo_t *zuo_symbol_from_string(const char *in_str, zuo_t *str_obj) {
+  return zuo_intern_from_string(in_str, str_obj, z.o_intern_table, zuo_symbol_tag);
+}
+
 static zuo_t *zuo_symbol(const char *in_str) {
   return zuo_symbol_from_string(in_str, z.o_undefined);
+}
+
+static zuo_t *zuo_keyword_from_string(const char *in_str, zuo_t *str_obj) {
+  return zuo_intern_from_string(in_str, str_obj, z.o_keyword_intern_table, zuo_keyword_tag);
+}
+
+static zuo_t *zuo_keyword(const char *in_str) {
+  return zuo_keyword_from_string(in_str, z.o_undefined);
 }
 
 static zuo_t *zuo_variable(zuo_t *name) {
@@ -1616,6 +1647,11 @@ static void zuo_out(zuo_out_t *out, zuo_t *obj, zuo_print_mode_t mode) {
         zuo_out(out, ((zuo_symbol_t *)obj)->str, zuo_display_mode);
         out_string(out, ">");
       }
+    } else if (obj->tag == zuo_keyword_tag) {
+      /* keywords always round-trip and self-quote: print `#:name` in
+         every mode, with no leading quote and no unreadable fallback */
+      out_string(out, "#:");
+      zuo_out(out, ((zuo_symbol_t *)obj)->str, zuo_display_mode);
     } else if (obj->tag == zuo_pair_tag) {
       zuo_pair_t *p = (zuo_pair_t *)obj;
       out_char(out, '(');
@@ -1896,6 +1932,16 @@ static void check_symbol(const char *who, zuo_t *obj) {
     zuo_fail_arg(who, "symbol", obj);
 }
 
+static void check_keyword(const char *who, zuo_t *obj) {
+  if (obj->tag != zuo_keyword_tag)
+    zuo_fail_arg(who, "keyword", obj);
+}
+
+static void check_symbol_or_keyword(const char *who, zuo_t *obj) {
+  if ((obj->tag != zuo_symbol_tag) && (obj->tag != zuo_keyword_tag))
+    zuo_fail_arg(who, "symbol or keyword", obj);
+}
+
 static void check_integer(const char *who, zuo_t *n) {
   if (n->tag != zuo_integer_tag)
     zuo_fail_arg(who, "integer", n);
@@ -2105,6 +2151,31 @@ static zuo_t *zuo_in(const unsigned char *s, zuo_int_t *_o, zuo_t *where, int sk
       } else if (peek_input(s, _o, "f")) {
         (*_o) += 1;
         obj = z.o_false;
+      } else if (s[*_o] == ':') {
+        /* `#:name` keyword; the interned name excludes the colon, as in
+           Racket (`(keyword->string #:foo)` => "foo") */
+        zuo_int_t start, len;
+        char *s2;
+        (*_o)++; /* consume `:` */
+        start = *_o;
+        while (1) {
+          c = s[*_o];
+          if ((c != 0) && (isalpha(c) || isdigit(c) || strchr(symbol_chars, c)))
+            (*_o)++;
+          else
+            break;
+        }
+        len = (*_o) - start;
+        if (len == 0) {
+          zuo_read_fail(_o, where, "expected keyword name after `#:`");
+          obj = z.o_undefined;
+        } else {
+          s2 = malloc(len+1);
+          memcpy(s2, s + start, len);
+          s2[len] = 0;
+          obj = zuo_keyword(s2);
+          free(s2);
+        }
       } else {
         zuo_read_fail(_o, where, "bad hash mark");
         obj = z.o_undefined;
@@ -2435,6 +2506,10 @@ static zuo_t *zuo_symbol_p(zuo_t *obj) {
   return (obj->tag == zuo_symbol_tag) ? z.o_true : z.o_false;
 }
 
+static zuo_t *zuo_keyword_p(zuo_t *obj) {
+  return (obj->tag == zuo_keyword_tag) ? z.o_true : z.o_false;
+}
+
 static zuo_t *zuo_procedure_p(zuo_t *obj) {
   return (((obj->tag == zuo_primitive_tag)
            || (obj->tag == zuo_closure_tag)
@@ -2656,16 +2731,32 @@ static zuo_t *zuo_symbol_to_string(zuo_t *obj) {
   return ((zuo_symbol_t *)obj)->str;
 }
 
+static zuo_t *zuo_string_to_keyword(zuo_t *obj) {
+  if (!zuo_is_string_without_nul(obj)) {
+    const char *who = "string->keyword";
+    check_string(who, obj);
+    zuo_fail_arg(who, "string without a nul character", obj);
+  }
+
+  return zuo_keyword_from_string(ZUO_STRING_PTR(obj), obj);
+}
+
+static zuo_t *zuo_keyword_to_string(zuo_t *obj) {
+  check_keyword("keyword->string", obj);
+  return ((zuo_symbol_t *)obj)->str;
+}
+
 static zuo_t *zuo_hash(zuo_t *args) {
   zuo_t *l, *ht;
 
   for (l = args; l->tag == zuo_pair_tag; l = _zuo_cdr(_zuo_cdr(l))) {
-    if ((_zuo_car(l)->tag != zuo_symbol_tag)
+    if (((_zuo_car(l)->tag != zuo_symbol_tag)
+         && (_zuo_car(l)->tag != zuo_keyword_tag))
         || (_zuo_cdr(l)->tag != zuo_pair_tag))
       break;
   }
   if (l != z.o_null)
-    zuo_fail1w("hash", "arguments not symbol keys interleaved with values", args);
+    zuo_fail1w("hash", "arguments not symbol or keyword keys interleaved with values", args);
 
   ht = z.o_empty_hash;
   for (l = args; l->tag == zuo_pair_tag; l = _zuo_cdr(_zuo_cdr(l)))
@@ -2683,7 +2774,7 @@ static zuo_t *zuo_hash_ref(zuo_t *ht, zuo_t *sym, zuo_t *defval) {
   zuo_t *v;
   const char *who = "hash-ref";
   check_hash(who, ht);
-  check_symbol(who, sym);
+  check_symbol_or_keyword(who, sym);
   v = zuo_trie_lookup(ht, sym);
   if (v == z.o_undefined) {
     if (defval == z.o_undefined) zuo_fail1w(who, "key is not present", sym);
@@ -2695,14 +2786,14 @@ static zuo_t *zuo_hash_ref(zuo_t *ht, zuo_t *sym, zuo_t *defval) {
 static zuo_t *zuo_hash_set(zuo_t *ht, zuo_t *sym, zuo_t *val) {
   const char *who = "hash-set";
   check_hash(who, ht);
-  check_symbol(who, sym);
+  check_symbol_or_keyword(who, sym);
   return zuo_trie_extend(ht, sym, val);
 }
 
 static zuo_t *zuo_hash_remove(zuo_t *ht, zuo_t *sym) {
   const char *who = "hash-remove";
   check_hash(who, ht);
-  check_symbol(who, sym);
+  check_symbol_or_keyword(who, sym);
   return zuo_trie_remove(ht, sym);
 }
 
@@ -7172,6 +7263,7 @@ static void zuo_primitive_init(int will_load_image) {
   z.o_void = zuo_new(zuo_singleton_tag, sizeof(zuo_forwarded_t));
   z.o_done_k = zuo_cont(zuo_done_cont, z.o_undefined, z.o_undefined, z.o_undefined, z.o_undefined);
   z.o_intern_table = zuo_trie_node();
+  z.o_keyword_intern_table = zuo_trie_node();
   z.o_top_env = zuo_trie_node();
 
   zuo_sync_in_case_of_fail();
@@ -7185,6 +7277,7 @@ static void zuo_primitive_init(int will_load_image) {
   ZUO_TOP_ENV_SET_PRIMITIVE1("integer?", zuo_integer_p);
   ZUO_TOP_ENV_SET_PRIMITIVE1("string?", zuo_string_p);
   ZUO_TOP_ENV_SET_PRIMITIVE1("symbol?", zuo_symbol_p);
+  ZUO_TOP_ENV_SET_PRIMITIVE1("keyword?", zuo_keyword_p);
   ZUO_TOP_ENV_SET_PRIMITIVE1("hash?", zuo_hash_p);
   ZUO_TOP_ENV_SET_PRIMITIVE1("list?", zuo_list_p);
   ZUO_TOP_ENV_SET_PRIMITIVE1("procedure?", zuo_procedure_p);
@@ -7232,6 +7325,8 @@ static void zuo_primitive_init(int will_load_image) {
   ZUO_TOP_ENV_SET_PRIMITIVE1("string->symbol", zuo_string_to_symbol);
   ZUO_TOP_ENV_SET_PRIMITIVE1("string->uninterned-symbol", zuo_string_to_uninterned_symbol);
   ZUO_TOP_ENV_SET_PRIMITIVE1("symbol->string", zuo_symbol_to_string);
+  ZUO_TOP_ENV_SET_PRIMITIVE1("string->keyword", zuo_string_to_keyword);
+  ZUO_TOP_ENV_SET_PRIMITIVE1("keyword->string", zuo_keyword_to_string);
   ZUO_TOP_ENV_SET_PRIMITIVEC("string-read", zuo_string_read);
 
   ZUO_TOP_ENV_SET_PRIMITIVEN("hash", zuo_hash, -1);
