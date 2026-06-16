@@ -1,0 +1,230 @@
+#lang zuo/datum
+
+;; Native keyword-argument support for the base `lambda`/`define`.
+;;
+;; `opt-lambda` (opt-lambda.zuo) delegates here when a formals list
+;; contains a `#:keyword` marker. Keywords are zuo's first-class
+;; self-evaluating keyword datatype, disjoint from symbols, so call
+;; sites write `#:name` unquoted and this module parses them out of the
+;; argument list at runtime.
+;;
+;;   id                positional, required
+;;   [id default]      positional, optional
+;;   #:kw id           keyword, required
+;;   #:kw [id default]  keyword, optional
+;;
+;; Expansion-time entry points: `kw-formals?` (detection) and
+;; `kw-lambda-expansion` (builds the `lambda` form). The runtime helpers
+;; (`kw-parse-args`, `kw-none`, `kw-missing-arg-error`) are embedded into
+;; the expansion as VALUES — raw procedures and the uninterned sentinel —
+;; not as names resolved at the use site, so user code cannot shadow or
+;; forge them. Only the core forms `lambda`/`let`/`if`/`quote` are emitted
+;; as symbols (the same capture model as the dotfiles `define/kw` this
+;; replaces; shadowing those as argument names breaks this macro).
+
+(require "../pair.zuo"
+         "../list.zuo"
+         "and-or.zuo"
+         "let.zuo")
+
+(provide kw-formals?
+         kw-lambda-expansion)
+
+;; ---------------------------------------------------------------------
+;; runtime helpers (module-private; embedded into expansions as values)
+
+;; Sentinel distinguishing "keyword absent" from any value a caller could
+;; pass, so defaults are only evaluated when actually needed.
+(define kw-none (string->uninterned-symbol "kw-none"))
+
+(define kw-missing-arg-error
+  (lambda (who kw)
+    (error (~a who ": missing required keyword argument " (~a kw)))))
+
+;; Partition a call's full argument list into positional values and a
+;; keyword hash: a `#:kw` keyword consumes the next element as its value;
+;; everything else is positional, in order. Returns (cons POSITIONALS HASH).
+(define kw-parse-args
+  (lambda (who args n-req n-opt allowed)
+    (let loop ([rest args] [rev-pos '()] [acc (hash)])
+      (cond
+        [(null? rest)
+         (let ([n (length rev-pos)])
+           (unless (and (>= n n-req) (<= n (+ n-req n-opt)))
+             (error (~a who ": wrong number of positional arguments: expected "
+                        (if (= n-opt 0)
+                            (~a n-req)
+                            (~a n-req " to " (+ n-req n-opt)))
+                        ", got " n " in " (~v args))))
+           (cons (reverse rev-pos) acc))]
+        [(keyword? (car rest))
+         (cond
+           [(not (ormap (lambda (k) (eq? k (car rest))) allowed))
+            (error (~a who ": unknown keyword " (~a (car rest))
+                       "; allowed keywords: " (~a allowed)))]
+           [(null? (cdr rest))
+            (error (~a who ": missing value for keyword " (~a (car rest))))]
+           [(not (eq? kw-none (hash-ref acc (car rest) kw-none)))
+            (error (~a who ": duplicate keyword " (~a (car rest))))]
+           [else
+            (loop (cddr rest) rev-pos (hash-set acc (car rest) (cadr rest)))])]
+        [else
+         (loop (cdr rest) (cons (car rest) rev-pos) acc)]))))
+
+;; ---------------------------------------------------------------------
+;; expansion-time formals parsing
+
+(define check-binder-id
+  (lambda (who stx seen-ids id)
+    ;; keywords are a distinct type, so `identifier?` already excludes them
+    (unless (identifier? id)
+      (error (~a who ": bad binding identifier " (~v id)) stx))
+    (when (ormap (lambda (s) (bound-identifier=? s id)) seen-ids)
+      (error (~a who ": duplicate argument name " (~a id)) stx))))
+
+;; Parse a formals list into tagged binders in formals order:
+;;   (pos ID) | (opt ID DEFAULT) | (kw #:KW ID) | (kw-opt #:KW ID DEFAULT)
+;; Keyword formals may be interleaved with positionals; a required
+;; positional may not follow an optional one (keywords are exempt).
+(define split-kw-formals
+  (lambda (who formals stx)
+    (unless (list? formals)
+      (error (~a who ": keyword arguments cannot be combined with a rest argument") stx))
+    (let loop ([fs formals] [rev-binders '()] [seen-ids '()] [seen-kws '()] [opt-pos? #f])
+      (cond
+        [(null? fs)
+         (reverse rev-binders)]
+        [(keyword? (car fs))
+         (let ([kw (car fs)])
+           (when (ormap (lambda (k) (eq? k kw)) seen-kws)
+             (error (~a who ": duplicate keyword " (~a kw)) stx))
+           (unless (pair? (cdr fs))
+             (error (~a who ": keyword " (~a kw) " is missing a binder, like "
+                        (~a kw) " id or " (~a kw) " [id default]")
+                    stx))
+           (let ([binder (cadr fs)])
+             (cond
+               [(identifier? binder)
+                (check-binder-id who stx seen-ids binder)
+                (loop (cddr fs)
+                      (cons (list 'kw kw binder) rev-binders)
+                      (cons binder seen-ids) (cons kw seen-kws) opt-pos?)]
+               [(and (list? binder) (= 2 (length binder)))
+                (check-binder-id who stx seen-ids (car binder))
+                (loop (cddr fs)
+                      (cons (list 'kw-opt kw (car binder) (cadr binder)) rev-binders)
+                      (cons (car binder) seen-ids) (cons kw seen-kws) opt-pos?)]
+               [else
+                (error (~a who ": after keyword " (~a kw)
+                           " expected a binder like id or [id default], got "
+                           (~v binder))
+                       stx)])))]
+        [(identifier? (car fs))
+         (when opt-pos?
+           (error (~a who ": required positional argument after optional one") stx))
+         (check-binder-id who stx seen-ids (car fs))
+         (loop (cdr fs)
+               (cons (list 'pos (car fs)) rev-binders)
+               (cons (car fs) seen-ids) seen-kws opt-pos?)]
+        [(and (list? (car fs)) (= 2 (length (car fs))))
+         (when (keyword? (caar fs))
+           (error (~a who ": keyword goes before the brackets, like "
+                      (~a (caar fs)) " [id default]; got " (~v (car fs)))
+                  stx))
+         (check-binder-id who stx seen-ids (caar fs))
+         (loop (cdr fs)
+               (cons (list 'opt (caar fs) (cadr (car fs))) rev-binders)
+               (cons (caar fs) seen-ids) seen-kws #t)]
+        [else
+         (error (~a who ": bad argument form " (~v (car fs))) stx)]))))
+
+;; Does a formals list contain a keyword marker? (Stops at any rest tail.)
+(define kw-formals?
+  (lambda (formals)
+    (let loop ([fs formals])
+      (cond
+        [(pair? fs) (or (keyword? (car fs)) (loop (cdr fs)))]
+        [else #f]))))
+
+;; ---------------------------------------------------------------------
+;; expansion-time output builder.
+;;
+;; `quasiquote` is not yet available this early in the bootstrap, so the
+;; output s-expression is built with list/cons. Every emitted form and
+;; procedure is referenced through `quote-syntax` — captured in THIS
+;; module's scope — so the expansion is HYGIENIC: shadowing `if`/`let`/
+;; `car`/etc. (or the helpers) at a use site cannot break a keyword lambda,
+;; matching opt-lambda's optional-argument expansion. The module-private
+;; runtime helpers are referenced the same way, like opt-lambda's
+;; `opt-arity-error`. (These `quote-syntax` constants work because this
+;; module is `require`d by opt-lambda and instantiated for its transformer;
+;; a phase-0 fn here may reference phase-0 constants in the same module.)
+
+(define stx-lambda (quote-syntax lambda))
+(define stx-let (quote-syntax let))
+(define stx-if (quote-syntax if))
+(define stx-quote (quote-syntax quote))
+(define stx-car (quote-syntax car))
+(define stx-cdr (quote-syntax cdr))
+(define stx-null? (quote-syntax null?))
+(define stx-eq? (quote-syntax eq?))
+(define stx-hash-ref (quote-syntax hash-ref))
+(define stx-parse (quote-syntax kw-parse-args))
+(define stx-missing (quote-syntax kw-missing-arg-error))
+(define stx-none (quote-syntax kw-none))
+
+(define mk-let
+  (lambda (id val body)
+    (list stx-let (list (list id val)) body)))
+
+;; Build the nested lets binding each formal in order, ending in the body.
+;; POS-ID / TAB-ID are the uninterned temps holding the positional list and
+;; the keyword hash; they are rebound (POS-ID) as positionals are consumed.
+(define kw-walk
+  (lambda (bs pos-id tab-id who body)
+    (cond
+      [(null? bs)
+       (cons stx-let (cons (list) body))]           ; (let () body...)
+      [(eq? (car (car bs)) 'pos)
+       (mk-let (cadr (car bs)) (list stx-car pos-id)
+               (mk-let pos-id (list stx-cdr pos-id)
+                       (kw-walk (cdr bs) pos-id tab-id who body)))]
+      [(eq? (car (car bs)) 'opt)
+       (mk-let (cadr (car bs))
+               (list stx-if (list stx-null? pos-id) (cadr (cdr (car bs))) (list stx-car pos-id))
+               (mk-let pos-id
+                       (list stx-if (list stx-null? pos-id) (list stx-quote (list)) (list stx-cdr pos-id))
+                       (kw-walk (cdr bs) pos-id tab-id who body)))]
+      [else
+       (let ([b (car bs)]
+             [val-id (string->uninterned-symbol "kw-val")])
+         (let ([id (cadr (cdr b))]
+               [kw (cadr b)]
+               [default (if (eq? (car b) 'kw-opt)
+                            (cadr (cddr b))
+                            (list stx-missing (list stx-quote who) (list stx-quote (cadr b))))])
+           (mk-let val-id (list stx-hash-ref tab-id (list stx-quote kw) stx-none)
+                   (mk-let id (list stx-if (list stx-eq? val-id stx-none) default val-id)
+                           (kw-walk (cdr bs) pos-id tab-id who body)))))])))
+
+;; Build the full `lambda` form for a keyword-accepting function. Called by
+;; opt-lambda only when `kw-formals?` is true, so there is always >=1 keyword.
+(define kw-lambda-expansion
+  (lambda (who formals body stx)
+    (let ([binders (split-kw-formals who formals stx)]
+          [args-id (string->uninterned-symbol "kw-args")]
+          [parsed-id (string->uninterned-symbol "kw-parsed")]
+          [pos-id (string->uninterned-symbol "kw-pos")]
+          [tab-id (string->uninterned-symbol "kw-tab")])
+      (let ([allowed (map cadr (filter (lambda (b) (or (eq? (car b) 'kw)
+                                                       (eq? (car b) 'kw-opt)))
+                                       binders))]
+            [n-req (length (filter (lambda (b) (eq? (car b) 'pos)) binders))]
+            [n-opt (length (filter (lambda (b) (eq? (car b) 'opt)) binders))])
+        (list stx-lambda args-id
+              (mk-let parsed-id
+                      (list stx-parse (list stx-quote who) args-id n-req n-opt
+                            (list stx-quote allowed))
+                      (mk-let pos-id (list stx-car parsed-id)
+                              (mk-let tab-id (list stx-cdr parsed-id)
+                                      (kw-walk binders pos-id tab-id who body)))))))))

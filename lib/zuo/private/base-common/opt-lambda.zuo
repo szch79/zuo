@@ -4,6 +4,7 @@
          "and-or.zuo"
          "syntax-error.zuo"
          "define-help.zuo"
+         "kw-lambda.zuo"
          "let.zuo")
 
 (provide (rename-out [opt-lambda lambda]))
@@ -23,6 +24,10 @@
        (cond
          [plain?
           (cons (quote-syntax lambda) (cdr stx))]
+         [(kw-formals? args)
+          ;; formals contain a `#:keyword` marker — keyword-free lambdas
+          ;; never reach here, so the fast/optional paths stay unchanged
+          (kw-lambda-expansion name args (cddr stx) stx)]
          [else
           (let ([all-args (check-args stx args)])
             (let loop ([args args] [rev-plain-args '()])

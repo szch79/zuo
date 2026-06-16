@@ -19,6 +19,23 @@
                 (list args)]
                [(pair? args)
                 (cond
+                  [(keyword? (car args))
+                   ;; `#:kw` marker: the next element is the binder, an
+                   ;; `id` or `[id default]`. Keyword binders are exempt
+                   ;; from the positional must-opt? ordering rule.
+                   (cond
+                     [(not (pair? (cdr args)))
+                      (syntax-error (~a (syntax-e (car stx)) ": keyword without a binder")
+                                    (car args))]
+                     [(identifier? (cadr args))
+                      (cons (cadr args) (loop (cddr args) must-opt?))]
+                     [(and (list? (cadr args))
+                           (= 2 (length (cadr args)))
+                           (identifier? (caar (cdr args))))
+                      (cons (caar (cdr args)) (loop (cddr args) must-opt?))]
+                     [else
+                      (syntax-error (~a (syntax-e (car stx)) ": bad keyword binder")
+                                    (cadr args))])]
                   [(and (identifier? (car args))
                         (not must-opt?))
                    (cons (car args) (loop (cdr args) #f))]
