@@ -209,8 +209,16 @@
 (check-bad-defines 'define)
 (check-bad-defines 'define-syntax)
 
-(define bad-macro "not a procedure or context consumer")
+(define bad-macro "not a procedure, context consumer, or binding consumer")
 
-(check-fail (define-syntax whatever 19) "not a procedure or context consumer")
+(check-fail (define-syntax whatever 19) "not a procedure, context consumer, or binding consumer")
 
 (check-fail (context-consumer 19) "not a procedure")
+
+;; a `define-for-syntax` binding occupies the same single binding slot as a
+;; runtime/transformer binding (zuo is single-phase), so a later `define` or
+;; `define-syntax` of the same name in the same context is a duplicate.
+(check-fail (let () (define-for-syntax foo 1) (define foo 2) foo)
+            "duplicate definition")
+(check-fail (let () (define-for-syntax foo 1) (define-syntax foo (lambda (s) s)) (foo))
+            "duplicate definition")

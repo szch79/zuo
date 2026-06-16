@@ -15,7 +15,8 @@
   (let* ([id (cadr s)]
          [id-bind (resolve state id #t)])
     (when (or (defined? id-bind)
-              (defined-macro? id-bind))
+              (defined-macro? id-bind)
+              (syntax-value? id-bind))
       (syntax-error "duplicate definition" id))
     (let* ([sym (syntax-e id)]
            [def-id (gensym sym)]
@@ -45,13 +46,32 @@
   (let* ([id (cadr s)]
          [id-bind (resolve state id #t)])
     (when (or (defined? id-bind)
-              (defined-macro? id-bind))
+              (defined-macro? id-bind)
+              (syntax-value? id-bind))
       (syntax-error "duplicate definition" id))
     (let* ([e (parse (cadr (cdr s)) id state)]
            [proc (kernel-eval e)])
-      (unless (or (procedure? proc) (context-consumer? proc))
-        (error "define-syntax: not a procedure or context consumer" proc))
+      (unless (or (procedure? proc) (context-consumer? proc) (binding-consumer? proc))
+        (error "define-syntax: not a procedure, context consumer, or binding consumer" proc))
       (add-binding state id (as-specific (make-defined-macro proc))))))
+
+;; Like `expand-define-syntax`, but binds the identifier to a
+;; compile-time VALUE (any datum) instead of a transformer. The value is
+;; retrievable at expansion time by a `binding-consumer` via its
+;; `local-value` argument; it is not callable and is rejected in
+;; expression position.
+(define (expand-define-for-syntax s state parse)
+  (unless (and (list? s) (= 3 (length s)) (identifier? (cadr s)))
+    (bad-syntax s))
+  (let* ([id (cadr s)]
+         [id-bind (resolve state id #t)])
+    (when (or (defined? id-bind)
+              (defined-macro? id-bind)
+              (syntax-value? id-bind))
+      (syntax-error "duplicate definition" id))
+    (let* ([e (parse (cadr (cdr s)) id state)]
+           [val (kernel-eval e)])
+      (add-binding state id (as-specific (make-syntax-value val))))))
 
 (define (expand-require s state mod-path)
   (let* ([check-renames
@@ -195,6 +215,9 @@
                                                  (expand-seq (cdr es) (cons new-s accum) new-state modtop)))]
                                [(eq? bind 'define-syntax)
                                 (let ([new-state (expand-define-syntax s state parse)])
+                                  (expand-seq (cdr es) accum new-state modtop))]
+                               [(eq? bind 'define-for-syntax)
+                                (let ([new-state (expand-define-for-syntax s state parse)])
                                   (expand-seq (cdr es) accum new-state modtop))]
                                [(eq? bind 'provide)
                                 (if modtop
@@ -482,6 +505,8 @@
                                    (lambda (new-s new-state)
                                      (parse new-s name state)))]
                      [(not bind) (syntax-error "unbound identifier" s)]
+                     [(syntax-value? bind)
+                      (syntax-error "for-syntax binding used in expression position" s)]
                      [(pair? bind) (syntax-error "cannot expand foreign syntax" s)]
                      [else bind]))]
                 [(null? s) (bad-syntax s)]

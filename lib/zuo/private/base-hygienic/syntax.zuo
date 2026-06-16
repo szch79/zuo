@@ -208,9 +208,17 @@
           (lambda (proc ctx)
             (let* ([new-scope (make-scope "macro")]
                    [s (add-scope s new-scope)]
+                   [local-value (lambda (id)
+                                  (let* ([bind (resolve* binds (datum->syntax ctx id) #f)]
+                                         [bind (unwrap-specific bind)]
+                                         [bind (if (initial-import? bind)
+                                                   (initial-import-bind bind)
+                                                   bind)])
+                                    (and (syntax-value? bind) (syntax-value-val bind))))]
                    [s (apply-macro* proc s name (lambda (a b)
                                                   (free-id=? binds (datum->syntax ctx a)
-                                                             (datum->syntax ctx b))))]
+                                                             (datum->syntax ctx b)))
+                                    local-value)]
                    [s (datum->syntax ctx s)]
                    [s (flip-scope s new-scope)])
               (k s binds)))])

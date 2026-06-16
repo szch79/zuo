@@ -22,7 +22,7 @@
            (hash-set provides sym (make-core-initial-bind (make-core-form sym))))
          kernel-provides
          '(lambda let letrec quote if begin
-                  define define-syntax require provide module+
+                  define define-syntax define-for-syntax require provide module+
                   quote-syntax quote-module-path
                   include)))
 
@@ -37,6 +37,8 @@
          [provides (add provides 'bound-identifier=? bound-identifier=?)]
          [provides (add provides 'context-consumer context-consumer)]
          [provides (add provides 'context-consumer? context-consumer?)]
+         [provides (add provides 'binding-consumer binding-consumer)]
+         [provides (add provides 'binding-consumer? binding-consumer?)]
          [provides (add provides 'dynamic-require dynamic-require)])
     provides))
 
@@ -54,6 +56,10 @@
                   (make-local-variable (variable-var bind))]
                  [(defined-macro? bind)
                   (make-exported-macro (defined-macro-proc bind) ctx)]
+                 [(syntax-value? bind)
+                  ;; a `define-for-syntax` value crosses module
+                  ;; boundaries unchanged (it is plain compile-time data)
+                  bind]
                  [else bind])])
     (if label
         (make-specific (cons bind label))

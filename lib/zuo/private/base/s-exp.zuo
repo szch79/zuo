@@ -147,8 +147,15 @@
 (define (apply-macro m s ctx binds name k)
   (let ([proc (if (defined-macro? m)
                   (defined-macro-proc m)
-                  (macro-implementation m))])
-    (k (apply-macro* proc s name (lambda (a b) (free-id=? binds a b)))
+                  (macro-implementation m))]
+        [local-value (lambda (id)
+                       (let* ([bind (resolve* binds id #f)]
+                              [bind (unwrap-specific bind)]
+                              [bind (if (initial-import? bind)
+                                        (initial-import-bind bind)
+                                        bind)])
+                         (and (syntax-value? bind) (syntax-value-val bind))))])
+    (k (apply-macro* proc s name (lambda (a b) (free-id=? binds a b)) local-value)
        binds)))
 
 ;; Convert a local macro to one that can be used as imported elsewhere

@@ -9,8 +9,11 @@
                (not bind2)
                (eq? (syntax-e id1) (syntax-e id2)))))))
 
-(define (apply-macro* proc s name free-id=?)
-  (let ([c-proc (context-consumer-procedure proc)])
-    (if c-proc
-        (c-proc s free-id=? (and name (symbol->string (syntax-e name))))
-        (proc s))))
+(define (apply-macro* proc s name free-id=? local-value)
+  (let ([b-proc (binding-consumer-procedure proc)])
+    (if b-proc
+        (b-proc s free-id=? local-value (and name (symbol->string (syntax-e name))))
+        (let ([c-proc (context-consumer-procedure proc)])
+          (if c-proc
+              (c-proc s free-id=? (and name (symbol->string (syntax-e name))))
+              (proc s))))))

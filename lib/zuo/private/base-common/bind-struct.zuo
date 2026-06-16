@@ -40,6 +40,15 @@
 ;; Imported or current-module macro
 (define macro? (make-?? macro-protocol 'defined-macro))
 
+;; A for-syntax binding: a compile-time value attached to an identifier
+;; by `define-for-syntax`, retrievable at expansion time through a
+;; `binding-consumer`'s `local-value`. `macro?` excludes this tag, so a
+;; for-syntax binding is never callable as a transformer; the parser
+;; also rejects it in expression position.
+(define make-syntax-value (make-maker 'syntax-value))
+(define syntax-value? (make-? 'syntax-value))
+(define syntax-value-val any-ref)
+
 ;; A `literal` wrapper is needed for a pair as a value; any
 ;; other kind of value is distinct from our "record"s
 (define make-literal (make-maker 'literal))
@@ -89,3 +98,15 @@
   (opaque context-consumer-key proc))
 (define (context-consumer? v) (and (opaque-ref context-consumer-key v #f) #t))
 (define (context-consumer-procedure v) (opaque-ref context-consumer-key v #f))
+
+;; A `binding-consumer` is like `context-consumer`, but its procedure
+;; additionally receives `local-value` -- used to retrieve a
+;; `define-for-syntax` compile-time value attached to an identifier --
+;; as its third argument, before `name`. The calling convention is
+;; (proc stx free-id=? local-value name), dispatched in `apply-macro*`.
+(define binding-consumer-key (string->uninterned-symbol "binder"))
+(define (binding-consumer proc)
+  (unless (procedure? proc) (error "binding-consumer: not a procedure" proc))
+  (opaque binding-consumer-key proc))
+(define (binding-consumer? v) (and (opaque-ref binding-consumer-key v #f) #t))
+(define (binding-consumer-procedure v) (opaque-ref binding-consumer-key v #f))
