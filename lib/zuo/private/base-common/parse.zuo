@@ -291,6 +291,32 @@
                                        sym+binds)))
                             outs
                             (cdr p))]
+                    [(id-sym-eq? form 'struct-out)
+                     (foldl (lambda (name outs)
+                              (unless (identifier? name) (bad-provide-form))
+                              ;; Resolve the struct's compile-time info via the
+                              ;; derived `NAME/info` side-channel (same path as
+                              ;; `local-value`), then re-export its full surface.
+                              (let* ([info-id (datum->syntax name
+                                                             (string->symbol (~a (syntax-e name) "/info")))]
+                                     [bind (resolve* (state-binds state) info-id #f)]
+                                     [bind (unwrap-specific bind)]
+                                     [bind (if (initial-import? bind)
+                                               (initial-import-bind bind)
+                                               bind)])
+                                (unless (syntax-value? bind)
+                                  (syntax-error "struct-out: not a struct" name))
+                                (let* ([sinfo (syntax-value-val bind)]
+                                       [pred-id (list-ref sinfo 1)]
+                                       [ctor-id (list-ref sinfo 2)]
+                                       [accessor-ids (list-ref sinfo 4)]
+                                       [self-id (list-ref sinfo 5)]
+                                       [ids (append (list ctor-id pred-id self-id) accessor-ids)])
+                                  (foldl (lambda (id outs) (add-provide outs id (syntax-e id)))
+                                         outs
+                                         ids))))
+                            outs
+                            (cdr p))]
                     [else (bad-provide-form)]))]
                [else (bad-provide-form)])))
          outs

@@ -24,6 +24,63 @@
     (define key `(,(quote-syntax quote)
                   ,(string->uninterned-symbol (symbol->string (syntax-e name)))))
     (define name? (datum->syntax name (string->symbol (~a (syntax-e name) "?"))))
+    ;; Compile-time struct-info side-channel: a derived identifier `NAME/info`
+    ;; bound (via `define-for-syntax`) to a positional list that `match`,
+    ;; `struct-copy`, and `struct-out` read at expansion time. See base-common
+    ;; struct-info contract in the plan.
+    (define info-id (datum->syntax name (string->symbol (~a (syntax-e name) "/info"))))
+    (define field-syms (map syntax-e fields))
+    (define accessor-ids
+      (map (lambda (field)
+             (datum->syntax field (string->symbol (~a (syntax-e name) "-" (syntax-e field)))))
+           fields))
+    ;; Per-field accessor and functional setter definitions.
+    (define field-defs
+      (let loop ([fields fields] [index 0])
+        (cond
+          [(null? fields) '()]
+          [else
+           (let ([field (car fields)])
+             (let ([ref (datum->syntax field (string->symbol (~a (syntax-e name)
+                                                                 "-"
+                                                                 (syntax-e field))))]
+                   [set (datum->syntax field (string->symbol (~a (syntax-e name)
+                                                                 "-set-"
+                                                                 (syntax-e field))))])
+               (define mk
+                 (lambda (head res)
+                   `(,(quote-syntax define) ,head
+                                            (,(quote-syntax let)
+                                             ([c (,(quote-syntax opaque-ref) ,key v #f)])
+                                             (,(quote-syntax if)
+                                              c
+                                              ,res
+                                              (,(quote-syntax arg-error)
+                                               (,(quote-syntax quote) ,(car head))
+                                               ,(symbol->string (syntax-e name))
+                                               v))))))
+               (cons
+                `(,(quote-syntax begin)
+                  ,(mk `(,ref v) `(,(quote-syntax list-ref) c ,index))
+                  ,(mk `(,set v a) `(,(quote-syntax opaque) ,key (,(quote-syntax list-set) c ,index a))))
+                (loop (cdr fields)
+                      (+ index 1)))))])))
+    ;; Emitted *after* the accessor defines: in the non-hygienic expander,
+    ;; `syntax-quote` inside `define-for-syntax` captures the context where an
+    ;; identifier is currently bound, so the accessors must already be bound
+    ;; (defined just above) for their captured ids to resolve. Emitting this
+    ;; earlier makes accessor ids fall back to the module context, which is
+    ;; wrong inside a local definition context. (The hygienic expander is
+    ;; order-insensitive here, since scopes ride on the id object itself.)
+    (define info-def
+      `(,(quote-syntax define-for-syntax) ,info-id
+        (,(quote-syntax list)
+         (,(quote-syntax quote) struct-info)
+         (,(quote-syntax quote-syntax) ,name?)
+         (,(quote-syntax quote-syntax) ,name)
+         (,(quote-syntax quote) ,field-syms)
+         (,(quote-syntax list) ,@(map (lambda (acc) `(,(quote-syntax quote-syntax) ,acc)) accessor-ids))
+         (,(quote-syntax quote-syntax) ,info-id))))
     `(,(quote-syntax begin)
       (,(quote-syntax define) ,name
                               (,(quote-syntax lambda)
@@ -33,32 +90,5 @@
       (,(quote-syntax define) (,name? v) (,(quote-syntax and)
                                           (,(quote-syntax opaque-ref) ,key v #f)
                                           #t))
-      ,@(let loop ([fields fields] [index 0])
-          (cond
-            [(null? fields) '()]
-            [else
-             (let ([field (car fields)])
-               (let ([ref (datum->syntax field (string->symbol (~a (syntax-e name)
-                                                                   "-"
-                                                                   (syntax-e field))))]
-                     [set (datum->syntax field (string->symbol (~a (syntax-e name)
-                                                                   "-set-"
-                                                                   (syntax-e field))))])
-                 (define mk
-                   (lambda (head res)
-                     `(,(quote-syntax define) ,head
-                                              (,(quote-syntax let)
-                                               ([c (,(quote-syntax opaque-ref) ,key v #f)])
-                                               (,(quote-syntax if)
-                                                c
-                                                ,res
-                                                (,(quote-syntax arg-error)
-                                                 (,(quote-syntax quote) ,(car head))
-                                                 ,(symbol->string (syntax-e name))
-                                                 v))))))
-                 (cons
-                  `(,(quote-syntax begin)
-                    ,(mk `(,ref v) `(,(quote-syntax list-ref) c ,index))
-                    ,(mk `(,set v a) `(,(quote-syntax opaque) ,key (,(quote-syntax list-set) c ,index a))))
-                  (loop (cdr fields)
-                        (+ index 1)))))])))))
+      ,@field-defs
+      ,info-def)))

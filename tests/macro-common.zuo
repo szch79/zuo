@@ -101,3 +101,87 @@
             (check err "")
             (check status 0)
             (check out "(list \"hi\" \"hi\")\n")))
+
+;; struct compile-time info: a `struct` attaches a `define-for-syntax`
+;; struct-info to the derived `NAME/info` id, retrievable through a
+;; `binding-consumer`'s `local-value`; `struct-out` re-exports the surface.
+
+(make-file "struct-info-same.zuo"
+           (struct posn (x y))
+           (define-syntax probe
+             (binding-consumer
+              (lambda (stx free-id=? local-value name)
+                (let* ([info-id (datum->syntax (cadr stx)
+                                               (string->symbol (~a (syntax-e (cadr stx)) "/info")))]
+                       [sinfo (local-value info-id)]
+                       [ctor (list-ref sinfo 2)]
+                       [accs (list-ref sinfo 4)])
+                  (list (quote-syntax list)
+                        (list (list-ref sinfo 1) (list ctor 1 2))
+                        (list (car accs) (list ctor 1 2))
+                        (list (cadr accs) (list ctor 1 2)))))))
+           (displayln (probe posn)))
+
+(run-zuo* (list (build-path macro-dir "struct-info-same.zuo"))
+          ""
+          (lambda (status out err)
+            (check err "")
+            (check status 0)
+            (check out "(#t 1 2)\n")))
+
+;; struct in a local definition context: the accessor ids stored in
+;; struct-info must resolve to the locally-bound accessors. (Regression:
+;; in the non-hygienic expander this fails unless the struct-info
+;; `define-for-syntax` is emitted after the accessor defines.)
+(make-file "struct-info-local.zuo"
+           (displayln
+            (let ()
+              (struct posn (x y))
+              (define-syntax probe
+                (binding-consumer
+                 (lambda (stx free-id=? local-value name)
+                   (let* ([info-id (datum->syntax (cadr stx)
+                                                  (string->symbol (~a (syntax-e (cadr stx)) "/info")))]
+                          [sinfo (local-value info-id)]
+                          [ctor (list-ref sinfo 2)]
+                          [accs (list-ref sinfo 4)])
+                     (list (quote-syntax list)
+                           (list (list-ref sinfo 1) (list ctor 1 2))
+                           (list (car accs) (list ctor 1 2))
+                           (list (cadr accs) (list ctor 1 2)))))))
+              (probe posn))))
+
+(run-zuo* (list (build-path macro-dir "struct-info-local.zuo"))
+          ""
+          (lambda (status out err)
+            (check err "")
+            (check status 0)
+            (check out "(#t 1 2)\n")))
+
+(make-file "exports-struct.zuo"
+           (provide (struct-out posn))
+           (struct posn (x y)))
+
+(make-file "uses-struct.zuo"
+           (require "exports-struct.zuo")
+           (define-syntax probe
+             (binding-consumer
+              (lambda (stx free-id=? local-value name)
+                (let* ([info-id (datum->syntax (cadr stx)
+                                               (string->symbol (~a (syntax-e (cadr stx)) "/info")))]
+                       [sinfo (local-value info-id)]
+                       [ctor (list-ref sinfo 2)]
+                       [accs (list-ref sinfo 4)])
+                  (list (quote-syntax list)
+                        (list (list-ref sinfo 1) (list ctor 5 6))
+                        (list (car accs) (list ctor 5 6))
+                        (list (cadr accs) (list ctor 5 6)))))))
+           (displayln (list (posn? (posn 3 4)) (posn-x (posn 3 4)) (posn-y (posn 3 4))))
+           (displayln (probe posn)))
+
+(run-zuo* (list (build-path macro-dir "uses-struct.zuo"))
+          ""
+          (lambda (status out err)
+            (check err "")
+            (check status 0)
+            (check out "(#t 3 4)\n(#t 5 6)\n")))
