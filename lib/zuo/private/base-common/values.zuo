@@ -1,0 +1,100 @@
+#lang zuo/datum
+
+;; Multiple values, simulated via zuo's `opaque` records. Shared source for
+;; both `#lang zuo` and `#lang zuo/hygienic`, so the macros are hygiene-correct
+;; (introduced identifiers go through `quote-syntax`; the kw-lambda idiom).
+;;
+;; A multi-values packet is an opaque record tagged with a module-private
+;; uninterned key; (values v) ≡ v, like Racket — a producer returning a single
+;; value is indistinguishable from a plain return. Only `call-with-values` (and
+;; the macros built on it) can destructure a packet; to any other code a packet
+;; is an opaque value distinct from pairs, lists, hashes, procedures, etc.
+
+(require "and-or.zuo"
+         "../pair.zuo"
+         "../list.zuo"
+         "define.zuo"
+         "let.zuo"
+         "quasiquote.zuo")
+
+(provide values
+         call-with-values
+         let-values
+         let*-values
+         define-values)
+
+(define values-key (string->uninterned-symbol "values"))
+(define no-packet  (string->uninterned-symbol "no-packet"))
+
+(define (values . vs)
+  (cond
+    [(and (pair? vs) (null? (cdr vs))) (car vs)]   ; exactly one: passthrough
+    [else (opaque values-key vs)]))                ; zero or 2+: pack
+
+(define (call-with-values producer consumer)
+  (let* ([v (producer)]
+         [vs (opaque-ref values-key v no-packet)])
+    (if (eq? vs no-packet)
+        (consumer v)
+        (apply consumer vs))))
+
+;; (let*-values ([(VAR ...) EXPR] ...) BODY ...) — sequential.
+;; Each clause's vars are in scope for subsequent clauses.
+(define-syntax let*-values
+  (lambda (stx)
+    (let ([clauses (cadr stx)]
+          [body (cddr stx)])
+      (let loop ([cs clauses])
+        (cond
+          [(null? cs) `(,(quote-syntax let) () ,@body)]
+          [else
+           (let ([clause (car cs)])
+             `(,(quote-syntax call-with-values)
+               (,(quote-syntax lambda) () ,(cadr clause))
+               (,(quote-syntax lambda) ,(car clause) ,(loop (cdr cs)))))])))))
+
+;; (let-values ([(VAR ...) EXPR] ...) BODY ...) — parallel.
+;; All RHSes evaluated before any variable is bound, so no clause sees
+;; another's vars. Implemented by packing each clause's values into a
+;; list with `call-with-values _ list`, binding all temps in one `let`,
+;; then destructuring into the user-named vars.
+(define-syntax let-values
+  (lambda (stx)
+    (let ([clauses (cadr stx)]
+          [body (cddr stx)])
+      (let* ([tmps (map (lambda (_) (string->uninterned-symbol "vs"))
+                        clauses)]
+             [outer (map (lambda (clause tmp)
+                           `(,tmp (,(quote-syntax call-with-values)
+                                   (,(quote-syntax lambda) () ,(cadr clause))
+                                   ,(quote-syntax list))))
+                         clauses tmps)]
+             [inner (apply append
+                           (map (lambda (clause tmp)
+                                  (let inner-loop ([vars (car clause)] [n 0])
+                                    (cond
+                                      [(null? vars) '()]
+                                      [else
+                                       (cons `(,(car vars) (,(quote-syntax list-ref) ,tmp ,n))
+                                             (inner-loop (cdr vars) (+ n 1)))])))
+                                clauses tmps))])
+        `(,(quote-syntax let) ,outer
+          (,(quote-syntax let) ,inner ,@body))))))
+
+;; (define-values (VAR ...) EXPR) — bind multiple vars from a multi-
+;; valued producer at definition position. Expands to a `begin` of
+;; defines, which zuo splices at top level and inside function bodies.
+(define-syntax define-values
+  (lambda (stx)
+    (let ([vars (cadr stx)]
+          [expr (car (cddr stx))]
+          [tmp (string->uninterned-symbol "vs")])
+      `(,(quote-syntax begin)
+        (,(quote-syntax define) ,tmp
+         (,(quote-syntax call-with-values) (,(quote-syntax lambda) () ,expr) ,(quote-syntax list)))
+        ,@(let loop ([vs vars] [n 0])
+            (cond
+              [(null? vs) '()]
+              [else
+               (cons `(,(quote-syntax define) ,(car vs) (,(quote-syntax list-ref) ,tmp ,n))
+                     (loop (cdr vs) (+ n 1)))]))))))

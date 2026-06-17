@@ -1,0 +1,522 @@
+#lang zuo/datum
+
+;; Pattern-matching `match`/`match-lambda`/`match-define` and Racket-style
+;; functional `struct-copy`. A `#lang zuo`-only language feature (wired in via
+;; `base/main.zuo`, not the shared `base-common/main.zuo`). Struct patterns and
+;; `struct-copy` resolve their predicate/accessors/constructor from the native
+;; `struct`'s compile-time `NAME/info` (Part 1) via the `local-value` a
+;; `binding-consumer` receives — so the emitted code is direct accessor/
+;; constructor calls with no runtime struct metadata and no name reconstruction.
+;;
+;; Every introduced identifier is a `quote-syntax` constant (so a use-site
+;; rebinding of `if`/`car`/etc. cannot break a match expansion); the pattern is
+;; dispatched on identifiers (`identifier?`/`syntax-e`); fresh temporaries are
+;; `string->uninterned-symbol`. The whole pattern compiler lives in this one
+;; self-contained module.
+
+(require "and-or.zuo"
+         "../pair.zuo"
+         "../list.zuo"
+         "define.zuo"
+         "let.zuo"
+         "quasiquote.zuo"
+         "../more.zuo"
+         "values.zuo")
+
+(provide match
+         match-lambda
+         match-define
+         struct-copy)
+
+;; Introduced identifiers, captured in this module's scope (hygienic).
+(define stx-let (quote-syntax let))
+(define stx-if (quote-syntax if))
+(define stx-lambda (quote-syntax lambda))
+(define stx-quote (quote-syntax quote))
+(define stx-error (quote-syntax error))
+(define stx-equal? (quote-syntax equal?))
+(define stx-pair? (quote-syntax pair?))
+(define stx-null? (quote-syntax null?))
+(define stx-car (quote-syntax car))
+(define stx-cdr (quote-syntax cdr))
+(define stx-qq-split (quote-syntax qq-split-at-tail))
+(define stx-define-values (quote-syntax define-values))
+(define stx-values (quote-syntax values))
+;; ---------------------------------------------------------------------
+;; struct-info access (Part 1 carrier): derive NAME/info off the type id and
+;; resolve it through `lv` (the binding-consumer's local-value).
+
+(define (struct-info-of lv name-id)
+  (unless (identifier? name-id)
+    (error "match: struct pattern needs a struct name" name-id))
+  (let* ([info-id (datum->syntax name-id
+                                 (string->symbol (~a (syntax-e name-id) "/info")))]
+         [info (lv info-id)])
+    (unless (and (pair? info) (eq? (car info) 'struct-info))
+      (error (~a "match: not a struct: " (syntax-e name-id))))
+    info))
+
+(define (struct-info-pred info) (list-ref info 1))
+(define (struct-info-ctor info) (list-ref info 2))
+(define (struct-info-fields info) (list-ref info 3))
+(define (struct-info-accessors info) (list-ref info 4))
+
+;; Map a field name (plain symbol) to its accessor id, or error.
+(define (field->accessor name-id field-syms accessor-ids fname)
+  (let loop ([fs field-syms] [as accessor-ids])
+    (cond
+      [(null? fs) (error (~a "match: struct " (syntax-e name-id)
+                             " has no field " fname))]
+      [(eq? (car fs) fname) (car as)]
+      [else (loop (cdr fs) (cdr as))])))
+
+;; ---------------------------------------------------------------------
+;; clause / pattern compilation
+
+;; Wrap clause bodies in `(let () ...)` rather than `(begin ...)` so internal
+;; defines work in any position. The failure expression is bound once as a
+;; thunk per clause and called as `(<fail>)` at every fail site, keeping the
+;; emitted AST linear in the clause count.
+(define (compile-clauses lv var clauses)
+  (cond
+    [(null? clauses)
+     `(,stx-error (,stx-quote match) "no matching clause for" ,var)]
+    [else
+     (let* ([cl (car clauses)]
+            [pat (car cl)]
+            [body (cdr cl)])
+       (cond
+         [(and (identifier? pat) (eq? (syntax-e pat) 'else))
+          `(,stx-let () ,@body)]
+         [else
+          (let ([fail (string->uninterned-symbol "fail")])
+            `(,stx-let ([,fail (,stx-lambda ()
+                                ,(compile-clauses lv var (cdr clauses)))])
+               ,(compile-pattern lv pat var
+                                 `(,stx-let () ,@body)
+                                 `(,fail))))]))]))
+
+(define (compile-pattern lv pat var success failure)
+  (cond
+    [(identifier? pat)
+     (cond
+       [(eq? (syntax-e pat) '_) success]
+       [else `(,stx-let ([,pat ,var]) ,success)])]
+    [(pair? pat)
+     (let* ([head (car pat)]
+            [head-sym (and (identifier? head) (syntax-e head))])
+       (cond
+         [(eq? head-sym 'quote)
+          `(,stx-if (,stx-equal? ,var (,stx-quote ,(syntax->datum (cadr pat))))
+                    ,success ,failure)]
+         [(eq? head-sym 'quasiquote)
+          (compile-qq-pattern lv (cadr pat) var success failure)]
+         [(eq? head-sym 'cons)
+          (compile-cons lv (cadr pat) (car (cddr pat)) var success failure)]
+         [(eq? head-sym 'list)
+          (compile-list lv (cdr pat) var success failure)]
+         [(eq? head-sym 'list*)
+          (compile-list* lv (cdr pat) var success failure)]
+         [(eq? head-sym '?)
+          (compile-pred lv (cadr pat) (cddr pat) var success failure)]
+         [(eq? head-sym 'or)
+          (compile-or lv (cdr pat) var success failure)]
+         [(eq? head-sym 'and)
+          (compile-each-pattern lv (cdr pat) var success failure)]
+         [(eq? head-sym 'not)
+          (compile-not lv (cdr pat) var success failure)]
+         [(eq? head-sym '=)
+          (compile-app lv (cadr pat) (car (cddr pat)) var success failure)]
+         [(eq? head-sym 'struct)
+          (compile-struct-fields lv (cadr pat) (cddr pat) var success failure)]
+         [head-sym
+          ;; positional struct pattern: (NAME P1 ... Pn)
+          (compile-struct-positional lv head (cdr pat) var success failure)]
+         [else
+          (error "match: bad pattern" pat)]))]
+    [(null? pat)
+     `(,stx-if (,stx-null? ,var) ,success ,failure)]
+    [else
+     `(,stx-if (,stx-equal? ,var (,stx-quote ,(syntax->datum pat))) ,success ,failure)]))
+
+;; Walk PAT and return the binder identifiers it introduces, left to right.
+;; Mirrors `compile-pattern`'s dispatch; used by `match-define`. Needs no `lv`
+;; (it only recurses to collect binders, never touching struct accessors).
+(define (pattern-vars pat)
+  (cond
+    [(identifier? pat)
+     (cond
+       [(eq? (syntax-e pat) '_) '()]
+       [else (list pat)])]
+    [(pair? pat)
+     (let* ([head (car pat)]
+            [head-sym (and (identifier? head) (syntax-e head))])
+       (cond
+         [(eq? head-sym 'quote) '()]
+         [(eq? head-sym 'quasiquote) (qq-pattern-vars (cadr pat))]
+         [(eq? head-sym 'cons)
+          (append (pattern-vars (cadr pat))
+                  (pattern-vars (car (cddr pat))))]
+         [(or (eq? head-sym 'list) (eq? head-sym 'list*))
+          (apply append (map pattern-vars (cdr pat)))]
+         [(eq? head-sym '?)
+          (apply append (map pattern-vars (cddr pat)))]
+         [(or (eq? head-sym 'or) (eq? head-sym 'and))
+          (apply append (map pattern-vars (cdr pat)))]
+         [(eq? head-sym 'not) '()]
+         [(eq? head-sym '=) (pattern-vars (car (cddr pat)))]
+         [(eq? head-sym 'struct)
+          (apply append
+                 (map (lambda (cl) (pattern-vars (cadr cl)))
+                      (cddr pat)))]
+         [head-sym  ; positional struct pattern
+          (apply append (map pattern-vars (cdr pat)))]
+         [else '()]))]
+    [else '()]))
+
+;; ---------------------------------------------------------------------
+;; quasiquote patterns
+
+(define (qq-tagged? qpat sym)
+  (and (pair? qpat) (identifier? (car qpat)) (eq? (syntax-e (car qpat)) sym)))
+
+(define (qq-pattern-vars qpat)
+  (cond
+    [(qq-tagged? qpat 'unquote) (pattern-vars (cadr qpat))]
+    [(qq-tagged? qpat 'unquote-splicing) (pattern-vars (cadr qpat))]
+    [(pair? qpat)
+     (append (qq-pattern-vars (car qpat))
+             (qq-pattern-vars (cdr qpat)))]
+    [else '()]))
+
+;; Quasiquoted pattern: literal structure with `(unquote PAT)` escapes
+;; and at most one `(unquote-splicing PAT)` per list level.
+(define (compile-qq-pattern lv qpat var success failure)
+  (cond
+    [(qq-tagged? qpat 'unquote)
+     (compile-pattern lv (cadr qpat) var success failure)]
+    [(pair? qpat)
+     (let ([parts (qq-find-splice qpat)])
+       (if parts
+           (compile-qq-splice lv (car parts) (cadr parts) (car (cddr parts))
+                              var success failure)
+           (compile-qq-pair lv qpat var success failure)))]
+    [(null? qpat)
+     `(,stx-if (,stx-null? ,var) ,success ,failure)]
+    [else
+     `(,stx-if (,stx-equal? ,var (,stx-quote ,(syntax->datum qpat))) ,success ,failure)]))
+
+(define (compile-qq-pair lv qpat var success failure)
+  (let ([v1 (string->uninterned-symbol "v1")]
+        [v2 (string->uninterned-symbol "v2")])
+    `(,stx-if (,stx-pair? ,var)
+         (,stx-let ([,v1 (,stx-car ,var)]
+                    [,v2 (,stx-cdr ,var)])
+           ,(compile-qq-pattern lv (car qpat) v1
+                                (compile-qq-pattern lv (cdr qpat) v2
+                                                    success failure)
+                                failure))
+         ,failure)))
+
+;; Walks a proper-list portion of qpat and locates `,@P`. Returns
+;; (list HEAD-ELEMS SPLICE-PAT TAIL-ELEMS) at the first splice, or #f
+;; if none. Errors on multiple splices in the same list level.
+(define (qq-find-splice qpat)
+  (let loop ([lst qpat] [head-rev '()])
+    (cond
+      [(null? lst) #f]
+      [(not (pair? lst)) #f]
+      [else
+       (let ([e (car lst)])
+         (cond
+           [(qq-tagged? e 'unquote-splicing)
+            (when (qq-has-splice? (cdr lst))
+              (error "match: multiple unquote-splicing in single list" qpat))
+            (list (reverse head-rev) (cadr e) (cdr lst))]
+           [else (loop (cdr lst) (cons e head-rev))]))])))
+
+(define (qq-has-splice? lst)
+  (cond
+    [(null? lst) #f]
+    [(not (pair? lst)) #f]
+    [(qq-tagged? (car lst) 'unquote-splicing) #t]
+    [else (qq-has-splice? (cdr lst))]))
+
+(define (compile-qq-splice lv head-pats splice-pat tail-pats var success failure)
+  (let* ([tail-len (length tail-pats)]
+         [middle-var (string->uninterned-symbol "mid")]
+         [tail-var (string->uninterned-symbol "tail")]
+         [split-var (string->uninterned-symbol "split")])
+    (let head-loop ([head-pats head-pats] [v var])
+      (cond
+        [(null? head-pats)
+         `(,stx-let ([,split-var (,stx-qq-split ,v ,tail-len)])
+            (,stx-if ,split-var
+                (,stx-let ([,middle-var (,stx-car ,split-var)]
+                           [,tail-var (,stx-cdr ,split-var)])
+                  ,(compile-pattern lv splice-pat middle-var
+                                    (compile-qq-pattern lv tail-pats tail-var
+                                                        success failure)
+                                    failure))
+                ,failure))]
+        [else
+         (let ([v1 (string->uninterned-symbol "v1")]
+               [v2 (string->uninterned-symbol "v2")])
+           `(,stx-if (,stx-pair? ,v)
+                (,stx-let ([,v1 (,stx-car ,v)]
+                           [,v2 (,stx-cdr ,v)])
+                  ,(compile-qq-pattern lv (car head-pats) v1
+                                       (head-loop (cdr head-pats) v2)
+                                       failure))
+                ,failure))]))))
+
+;; Runtime helper invoked by code emitted from compile-qq-splice (referenced
+;; through `stx-qq-split`, so it is module-private — not a user-facing export).
+;; Returns (cons MIDDLE TAIL-LIST) where TAIL-LIST has tail-len elements, or #f
+;; if `lst` is improper or shorter than tail-len.
+(define (qq-split-at-tail lst tail-len)
+  (let measure ([l lst] [n 0])
+    (cond
+      [(null? l)
+       (cond
+         [(>= n tail-len)
+          (let split ([l lst] [k (- n tail-len)])
+            (if (= k 0)
+                (cons '() l)
+                (let ([rest (split (cdr l) (- k 1))])
+                  (cons (cons (car l) (car rest)) (cdr rest)))))]
+         [else #f])]
+      [(pair? l) (measure (cdr l) (+ n 1))]
+      [else #f])))
+
+;; ---------------------------------------------------------------------
+;; structural patterns
+
+(define (compile-cons lv p1 p2 var success failure)
+  (let ([v1 (string->uninterned-symbol "v1")]
+        [v2 (string->uninterned-symbol "v2")])
+    `(,stx-if (,stx-pair? ,var)
+         (,stx-let ([,v1 (,stx-car ,var)]
+                    [,v2 (,stx-cdr ,var)])
+           ,(compile-pattern lv p1 v1
+                             (compile-pattern lv p2 v2 success failure)
+                             failure))
+         ,failure)))
+
+(define (compile-list lv pats var success failure)
+  (cond
+    [(null? pats)
+     `(,stx-if (,stx-null? ,var) ,success ,failure)]
+    [else
+     (let ([v1 (string->uninterned-symbol "v1")]
+           [v2 (string->uninterned-symbol "v2")])
+       `(,stx-if (,stx-pair? ,var)
+            (,stx-let ([,v1 (,stx-car ,var)]
+                       [,v2 (,stx-cdr ,var)])
+              ,(compile-pattern lv (car pats) v1
+                                (compile-list lv (cdr pats) v2 success failure)
+                                failure))
+            ,failure))]))
+
+(define (compile-list* lv pats var success failure)
+  (cond
+    [(null? pats)
+     (error "match: list* needs at least one sub-pattern")]
+    [(null? (cdr pats))
+     (compile-pattern lv (car pats) var success failure)]
+    [else
+     (let ([v1 (string->uninterned-symbol "v1")]
+           [v2 (string->uninterned-symbol "v2")])
+       `(,stx-if (,stx-pair? ,var)
+            (,stx-let ([,v1 (,stx-car ,var)]
+                       [,v2 (,stx-cdr ,var)])
+              ,(compile-pattern lv (car pats) v1
+                                (compile-list* lv (cdr pats) v2 success failure)
+                                failure))
+            ,failure))]))
+
+(define (compile-pred lv pred sub-pats var success failure)
+  `(,stx-if (,pred ,var)
+       ,(compile-each-pattern lv sub-pats var success failure)
+       ,failure))
+
+(define (compile-each-pattern lv pats var success failure)
+  (cond
+    [(null? pats) success]
+    [else
+     (compile-pattern lv (car pats) var
+                      (compile-each-pattern lv (cdr pats) var success failure)
+                      failure)]))
+
+;; (or P1 P2 ...): try each in turn. Bindings introduced by Pi are visible in
+;; `success` only when Pi matched (no cross-branch consistency check).
+(define (compile-or lv pats var success failure)
+  (cond
+    [(null? pats) failure]
+    [else
+     (compile-pattern lv (car pats) var
+                      success
+                      (compile-or lv (cdr pats) var success failure))]))
+
+;; (not P1 P2 ...): match iff none of Pi match. Bindings from Pi fall in the
+;; discarded failure branch, so they are not exposed.
+(define (compile-not lv pats var success failure)
+  (cond
+    [(null? pats) success]
+    [else
+     (compile-pattern lv (car pats) var
+                      failure
+                      (compile-not lv (cdr pats) var success failure))]))
+
+;; (= EXPR P): bind v = (EXPR var), match P against v.
+(define (compile-app lv expr p var success failure)
+  (let ([v (string->uninterned-symbol "v")])
+    `(,stx-let ([,v (,expr ,var)])
+       ,(compile-pattern lv p v success failure))))
+
+;; (struct NAME [F1 P1] [F2 P2] ...): explicit-field struct pattern. Reads the
+;; predicate + per-field accessors from NAME's compile-time struct-info.
+(define (compile-struct-fields lv name-id field-clauses var success failure)
+  (let* ([info (struct-info-of lv name-id)]
+         [pred-id (struct-info-pred info)]
+         [field-syms (struct-info-fields info)]
+         [accessor-ids (struct-info-accessors info)])
+    `(,stx-if (,pred-id ,var)
+         ,(let loop ([clauses field-clauses])
+            (cond
+              [(null? clauses) success]
+              [else
+               (let ([cl (car clauses)])
+                 (unless (and (pair? cl) (pair? (cdr cl)) (null? (cddr cl))
+                              (identifier? (car cl)))
+                   (error "match: struct pattern field clause must be [field pat]" cl))
+                 (let* ([fname (syntax-e (car cl))]
+                        [pat (cadr cl)]
+                        [acc (field->accessor name-id field-syms accessor-ids fname)]
+                        [v (string->uninterned-symbol "v")])
+                   `(,stx-let ([,v (,acc ,var)])
+                      ,(compile-pattern lv pat v
+                                        (loop (cdr clauses))
+                                        failure))))]))
+         ,failure)))
+
+;; (NAME P1 P2 ... Pn): positional struct pattern. Arity is checked at
+;; expansion against the struct's field count.
+(define (compile-struct-positional lv name-id pats var success failure)
+  (let* ([info (struct-info-of lv name-id)]
+         [pred-id (struct-info-pred info)]
+         [field-syms (struct-info-fields info)]
+         [accessor-ids (struct-info-accessors info)])
+    (unless (= (length pats) (length field-syms))
+      (error (~a "match: struct " (syntax-e name-id) " expects "
+                 (length field-syms) " fields, pattern has " (length pats))))
+    `(,stx-if (,pred-id ,var)
+         ,(let loop ([pats pats] [accs accessor-ids])
+            (cond
+              [(null? pats) success]
+              [else
+               (let ([v (string->uninterned-symbol "v")])
+                 `(,stx-let ([,v (,(car accs) ,var)])
+                    ,(compile-pattern lv (car pats) v
+                                      (loop (cdr pats) (cdr accs))
+                                      failure)))]))
+         ,failure)))
+
+;; ---------------------------------------------------------------------
+;; struct-copy: read struct-info and splice a constructor rebuild. Duplicate
+;; and unknown-field errors are raised here, at expansion time.
+(define (compile-struct-copy lv name-id expr clauses)
+  (let* ([info (struct-info-of lv name-id)]
+         [pred-id (struct-info-pred info)]
+         [ctor-id (struct-info-ctor info)]
+         [field-syms (struct-info-fields info)]
+         [accessor-ids (struct-info-accessors info)]
+         [base (string->uninterned-symbol "base")])
+    (for-each
+     (lambda (cl)
+       (unless (and (pair? cl) (pair? (cdr cl)) (null? (cddr cl))
+                    (identifier? (car cl)))
+         (error "struct-copy: field clause must be [field-id expr]" cl)))
+     clauses)
+    (let dup-check ([cs clauses] [seen '()])
+      (cond
+        [(null? cs) (void)]
+        [(member (syntax-e (caar cs)) seen)
+         (error (~a "struct-copy: duplicate field " (syntax-e (caar cs))))]
+        [else (dup-check (cdr cs) (cons (syntax-e (caar cs)) seen))]))
+    ;; validate field names against the struct
+    (for-each
+     (lambda (cl)
+       (field->accessor name-id field-syms accessor-ids (syntax-e (car cl))))
+     clauses)
+    ;; Rebuild via the constructor: each field gets its override expr (spliced
+    ;; once) or the original accessor read. Override side effects follow zuo's
+    ;; own argument-evaluation order, like any constructor call.
+    `(,stx-let ([,base ,expr])
+       (,stx-if (,pred-id ,base)
+           (,ctor-id
+            ,@(map (lambda (f a)
+                     (let ([override (assoc-field clauses f)])
+                       (if override (cadr override) `(,a ,base))))
+                   field-syms accessor-ids))
+           (,stx-error (,stx-quote struct-copy) "expected struct"
+                       (,stx-quote ,(syntax-e name-id)) ,base)))))
+
+;; Find the clause overriding FIELD (a plain symbol), or #f.
+(define (assoc-field clauses field)
+  (cond
+    [(null? clauses) #f]
+    [(eq? (syntax-e (caar clauses)) field) (car clauses)]
+    [else (assoc-field (cdr clauses) field)]))
+
+;; ---------------------------------------------------------------------
+;; surface macros (binding-consumers, so they receive `local-value` as `lv`)
+
+(define-syntax match
+  (binding-consumer
+   (lambda (stx free-id=? lv name)
+     (unless (and (pair? stx) (pair? (cdr stx)))
+       (error "match: bad syntax" stx))
+     (let ([expr (cadr stx)]
+           [clauses (cddr stx)]
+           [v (string->uninterned-symbol "v")])
+       `(,stx-let ([,v ,expr])
+          ,(compile-clauses lv v clauses))))))
+
+(define-syntax match-lambda
+  (binding-consumer
+   (lambda (stx free-id=? lv name)
+     (unless (pair? stx)
+       (error "match-lambda: bad syntax" stx))
+     (let ([clauses (cdr stx)]
+           [v (string->uninterned-symbol "v")])
+       `(,stx-lambda (,v) ,(compile-clauses lv v clauses))))))
+
+;; (match-define PAT EXPR) — destructure-binding form. Pattern-matches EXPR
+;; against PAT and introduces PAT's binders at the surrounding scope via
+;; `define-values`. Match failure raises an error — match-define is strict.
+(define-syntax match-define
+  (binding-consumer
+   (lambda (stx free-id=? lv name)
+     (unless (and (list? stx) (= (length stx) 3))
+       (error "match-define: expected (match-define PAT EXPR)" stx))
+     (let* ([pat (cadr stx)]
+            [expr (car (cddr stx))]
+            [vars (pattern-vars pat)]
+            [v (string->uninterned-symbol "v")])
+       `(,stx-define-values ,vars
+          (,stx-let ([,v ,expr])
+            ,(compile-pattern lv pat v
+                              `(,stx-values ,@vars)
+                              `(,stx-error (,stx-quote match-define)
+                                           "match failed" ,v))))))))
+
+;; (struct-copy NAME EXPR [FIELD VAL] ...) — Racket-style functional update.
+;; Reads NAME's struct-info and splices a constructor rebuild; duplicate and
+;; unknown-field errors are raised at expansion.
+(define-syntax struct-copy
+  (binding-consumer
+   (lambda (stx free-id=? lv name)
+     (unless (and (list? stx) (>= (length stx) 3) (identifier? (cadr stx)))
+       (error "struct-copy: bad syntax" stx))
+     (compile-struct-copy lv (cadr stx) (car (cddr stx)) (cdr (cddr stx))))))

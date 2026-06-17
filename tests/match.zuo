@@ -1,0 +1,145 @@
+#lang zuo
+
+;; `match`/`match-lambda`/`match-define`/`struct-copy` — a `#lang zuo`-only
+;; language feature, so these tests run only here (no hygienic counterpart).
+
+(require "harness.zuo")
+
+(alert "match")
+
+(define lang-name (quote zuo))
+
+(define match-dir (build-path tmp-dir "match"))
+(rm* match-dir)
+(mkdir match-dir)
+
+(struct posn (x y))
+(struct leaf (v))
+(struct node (l r))
+(struct nil ())
+
+;; --- non-struct patterns ---------------------------------------------------
+
+(check (match 5 [5 'five] [_ 'other]) 'five)            ; literal
+(check (match 6 [5 'five] [_ 'other]) 'other)           ; wildcard fallthrough
+(check (match "hi" ["hi" 'yes]) 'yes)                   ; string literal
+(check (match #t [#t 'true] [#f 'false]) 'true)         ; boolean literal
+(check (match 42 [x (+ x 1)]) 43)                       ; variable
+(check (match 42 [_ 'wild]) 'wild)                      ; wildcard
+(check (match 'sym ['sym 'q]) 'q)                       ; quote
+(check (match (cons 1 2) [(cons a b) (list a b)]) '(1 2))
+(check (match (list 1 2 3) [(list a b c) (+ a b c)]) 6)
+(check (match '() [(list) 'empty]) 'empty)
+(check (match (list 1 2 3 4) [(list* a b rest) (list a b rest)]) '(1 2 (3 4)))
+(check (match (list 5) [(list* a) a]) '(5))             ; list* single binds whole
+(check (match 7 [(? integer?) 'num] [_ 'no]) 'num)      ; ? predicate, no binder
+(check (match "x" [(? integer?) 'num] [_ 'no]) 'no)
+(check (match 7 [(? integer? n) (* n n)]) 49)           ; ? predicate + binder
+(check (match 5 [(and x (? integer?)) x]) 5)            ; and
+(check (match 5 [(or 1 2 5) 'hit] [_ 'miss]) 'hit)      ; or
+(check (match 3 [(not 1 2) 'ok] [_ 'no]) 'ok)           ; not
+(check (match 4 [(= (lambda (n) (* n 2)) 8) 'yes]) 'yes); =
+
+;; quasiquote patterns
+(check (match (list 1 2 3) [`(1 ,b ,c) (list b c)]) '(2 3))
+(check (match (list 1 2 3 4) [`(1 ,@mid 4) mid]) '(2 3))     ; ,@ splice
+(check (match (cons 1 2) [`(1 . ,b) b]) 2)                   ; dotted tail
+(check (match (list 'a 'b) [`(a b) 'lit]) 'lit)             ; all-literal
+
+;; clause bodies / ordering
+(check (match 1 [1 'a (+ 2 3)]) 5)                     ; multi-expression body
+(check (match 9 [(? string?) 'no] [n n]) 9)           ; fallthrough to variable
+(check (match 'z [(or 'a 'b) 'ab] [else 'other]) 'other) ; else clause
+
+;; --- struct patterns -------------------------------------------------------
+
+(check (match (posn 1 2) [(posn a b) (list a b)]) '(1 2))        ; positional
+(check (match (posn 1 2) [(struct posn [y a] [x b]) (list a b)]) '(2 1)) ; field, reordered
+(check (match (posn 1 2) [(struct posn [x a]) a]) 1)           ; partial field pattern
+(check (match (node (leaf 1) (leaf 2)) [(node (leaf a) (leaf b)) (+ a b)]) 3) ; nested
+(check (match (nil) [(nil) 'empty]) 'empty)                    ; 0-field struct
+(check (match (list 0 (posn 3 4)) [`(0 ,(posn a b)) (list a b)]) '(3 4)) ; struct under qq
+
+;; hygiene: a use-site rebinding of core forms must not break a match
+;; expansion (every introduced identifier is `quote-syntax`'d).
+(check (let ([if 'shadowed] [car 'nope] [cons 'x] [list 'y])
+         (match (posn 1 2) [(posn a b) (+ a b)]))
+       3)
+
+;; --- match-lambda / match-define ------------------------------------------
+
+(check ((match-lambda [(posn a b) (- a b)]) (posn 10 3)) 7)
+(check ((match-lambda [(list a) a] [(list a b) (+ a b)]) (list 4 5)) 9)
+
+(check (let () (match-define (posn a b) (posn 11 22)) (list a b)) '(11 22))
+(check (let () (match-define (list a b c) (list 1 2 3)) (+ a b c)) 6)
+(check (let () (match-define (cons a d) (cons 'h '(i))) (list a d)) '(h (i)))
+(check (let () (match-define 5 5) 'ok) 'ok)            ; literal pattern, no binders
+
+;; --- struct-copy -----------------------------------------------------------
+
+(check (let ([p (struct-copy posn (posn 1 2) [y 99])])
+         (list (posn-x p) (posn-y p)))
+       '(1 99))                                         ; single override
+(check (let ([p (struct-copy posn (posn 1 2) [x 7] [y 8])])
+         (list (posn-x p) (posn-y p)))
+       '(7 8))                                          ; multiple overrides
+(check (let ([p (struct-copy posn (posn 5 6))])
+         (list (posn-x p) (posn-y p)))
+       '(5 6))                                          ; passthrough only
+(check (let* ([p (struct-copy posn (posn 1 2) [x 10])]
+              [q (struct-copy posn p [y 20])])
+         (list (posn-x q) (posn-y q)))
+       '(10 20))                                        ; nested struct-copy
+
+;; --- multiple values (the `values` module) --------------------------------
+
+(check (call-with-values (lambda () (values 1 2 3)) list) '(1 2 3))
+(check (let-values ([(a b) (values 1 2)] [(c) (values 3)]) (list a b c)) '(1 2 3))
+(check (let*-values ([(a b) (values 1 2)] [(c) (values (+ a b))]) (list a b c)) '(1 2 3))
+(check (let () (define-values (a b) (values 10 20)) (list a b)) '(10 20))
+
+;; --- error cases (run as child programs; messages name the struct) --------
+;; check-fail runs the bare expression in a fresh module, so struct-dependent
+;; cases define `posn` inline.
+
+(check-fail (match 1 [2 'no]) "no matching clause")
+(check-fail (let () (struct posn (x y)) (match-define (posn a b) 5) a) "match failed")
+(check-fail (let () (struct posn (x y)) (match (posn 1 2) [(nonsuch a b) a])) "not a struct: nonsuch")
+(check-fail (let () (struct posn (x y)) (match (posn 1 2) [(posn a) a])) "expects 2 fields")
+(check-fail (let () (struct posn (x y)) (match (posn 1 2) [(struct posn [z q]) q])) "has no field z")
+(check-fail (let () (struct posn (x y)) (struct-copy posn (posn 1 2) [z 9])) "has no field z")
+(check-fail (let () (struct posn (x y)) (struct-copy posn (posn 1 2) [x 1] [x 2])) "duplicate field x")
+
+;; --- cross-module: (struct-out NAME) + match in an importer ---------------
+
+(define (make-match-file* path content)
+  (let ([fd (fd-open-output (build-path match-dir path) :truncate)])
+    (fd-write fd (~a "#lang " lang-name "\n" (~s (cons 'begin content))))
+    (fd-close fd)))
+
+(define-syntax (make-match-file stx)
+  (list (quote-syntax make-match-file*)
+        (cadr stx)
+        (cons (quote-syntax list)
+              (map (lambda (c) (list (quote-syntax quote) c))
+                   (cddr stx)))))
+
+(make-match-file "exports-shape.zuo"
+                 (provide (struct-out posn))
+                 (struct posn (x y)))
+
+(make-match-file "uses-shape.zuo"
+                 (require "exports-shape.zuo")
+                 ;; positional + field match and struct-copy on an imported struct
+                 (displayln (match (posn 3 4) [(posn a b) (list a b)]))
+                 (displayln (match (posn 3 4) [(struct posn [y b]) b]))
+                 (let ([p (struct-copy posn (posn 3 4) [x 30])])
+                   (displayln (list (posn-x p) (posn-y p)))))
+
+(run-zuo* (list (build-path match-dir "uses-shape.zuo"))
+          ""
+          (lambda (status out err)
+            (check err "")
+            (check status 0)
+            (check out "(3 4)\n4\n(30 4)\n")))

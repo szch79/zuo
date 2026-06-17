@@ -29,5 +29,7 @@
 (require "form-hygienic.zuo")
 (require "macro.zuo")
 (require "macro-hygienic.zuo")
+(require "values.zuo")
+(require "match.zuo")
 
 (alert "... tests passed!")
