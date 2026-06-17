@@ -33,5 +33,6 @@
 (require "match.zuo")
 (require "set.zuo")
 (require "syntax-rules.zuo")
+(require "for.zuo")
 
 (alert "... tests passed!")

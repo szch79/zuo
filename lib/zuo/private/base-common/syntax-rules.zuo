@@ -14,7 +14,6 @@
 (require "and-or.zuo"      ; cond, else, and, unless
          "../pair.zuo"     ; cadr, cddr
          "../list.zuo"     ; map, for-each
-         "../more.zuo"     ; list?
          "let.zuo"         ; let, let*
          "quasiquote.zuo"  ; `/, in the emitted transformer bodies
          "syntax-helpers.zuo")

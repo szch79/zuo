@@ -1,0 +1,96 @@
+#lang zuo
+
+;; `for` / `for/list` / `for/fold` / `for/or` / `for/and` — a `#lang zuo`-only
+;; feature (wired in via base/main.zuo). The binding LHS reuses Part 2's
+;; `match` pattern compiler, so cons/struct patterns work; the struct case is
+;; the proof that the binding-consumer `lv` is threaded to `compile-pattern`.
+
+(require "harness.zuo")
+
+(alert "for")
+
+;; --- for: runs body for effect, returns void --------------------------------
+
+(check (void? (for ([x '(1 2 3)]) x)) #t)
+;; body runs once per element (counted via for/fold below mirrors this)
+
+;; --- for/list over in-range (1 / 2 / 3-arg incl. negative step) -------------
+
+(check (for/list ([x (in-range 3)]) x) '(0 1 2))
+(check (for/list ([x (in-range 1 4)]) x) '(1 2 3))
+(check (for/list ([x (in-range 0 6 2)]) x) '(0 2 4))
+(check (for/list ([x (in-range 5 0 -2)]) x) '(5 3 1))
+
+;; --- for/list over a list, with #:when / #:unless / #:do -----------------------
+
+(check (for/list ([x '(1 2 3 4)] #:when (> x 2)) x) '(3 4))
+(check (for/list ([x '(1 2 3 4)] #:unless (> x 2)) x) '(1 2))
+(check (for/list ([x '(1 2 3)] #:do ((define y (* x 10)))) y) '(10 20 30))
+;; failed #:when short-circuits a later clause's effect
+(check (for/list ([x '(1 2 3 4)] #:when (> x 2) #:unless (= x 4)) x) '(3))
+
+;; --- compile-pattern reuse: cons + struct binding LHS (lv threading proof) --
+
+(check (for/list ([(cons a b) (list (cons 1 2) (cons 3 4))]) a) '(1 3))
+
+(struct posn (x y))
+(check (for/list ([(posn a b) (list (posn 1 2) (posn 3 4))]) (+ a b)) '(3 7))
+;; struct pattern also threads lv through the for/fold path
+(check (for/fold ([s 0]) ([(posn a b) (list (posn 1 2) (posn 3 4))]) (+ s a b)) 10)
+
+;; --- gensym loop symbol: nesting + a user `loop` binding never capture ------
+
+(check (for/list ([x (in-range 2)]) (for/list ([y (in-range 2)]) (list x y)))
+       (list (list (list 0 0) (list 0 1)) (list (list 1 0) (list 1 1))))
+(check (let ([loop 42]) (for/list ([x (in-range 3)]) (+ x loop))) '(42 43 44))
+
+;; --- for/fold: single-acc / #:result / multi-acc + #:result -------------------
+
+(check (for/fold ([acc 0]) ([x '(1 2 3)]) (+ acc x)) 6)
+(check (for/fold ([acc 0] #:result (* 2 acc)) ([x '(1 2 3)]) (+ acc x)) 12)
+(check (for/fold ([sum 0] [n 0] #:result (list sum n)) ([x '(1 2 3)])
+         (values (+ sum x) (+ n 1)))
+       (list 6 3))
+
+;; --- for/or / for/and: short-circuit semantics ------------------------------
+
+(check (for/or ([x '(#f #f 7)]) x) 7)
+(check (for/or ([x '(#f #f)]) x) #f)
+(check (for/or ([x '()]) x) #f)
+(check (for/and ([x '(1 2 3)]) (* x 10)) 30)         ; last truthy
+(check (for/and ([x '(1 #f 3)]) x) #f)               ; short-circuit on #f
+(check (for/and ([x '()]) x) #t)                     ; empty -> #t
+
+;; --- in-set: iterate set elements (order unspecified -> assert count) -------
+
+(check (for/fold ([n 0]) ([x (in-set (set 'a 'b 'c))]) (+ n 1)) 3)
+
+;; --- in-directory / in-directory* over a scratch tree -----------------------
+;;   for-scratch/
+;;     a.txt        (file)
+;;     sub/         (dir)
+;;       b.txt      (file)
+;; Pre-order DFS including the start path => 4 nodes: 2 dirs, 2 files.
+
+(define scratch (build-path tmp-dir "for-scratch"))
+(rm* scratch)
+(mkdir-p scratch)
+(mkdir-p (build-path scratch "sub"))
+(fd-close (fd-open-output (build-path scratch "a.txt") :can-update))
+(fd-close (fd-open-output (build-path scratch "sub" "b.txt") :can-update))
+
+;; in-directory yields every node (path only), start path included.
+(check (length (for/list ([p (in-directory scratch)]) p)) 4)
+;; the start path itself is yielded
+(check (for/or ([p (in-directory scratch)] #:when (equal? p scratch)) #t) #t)
+
+;; in-directory* yields (path type); count files vs dirs.
+(check (for/fold ([files 0] [dirs 0] #:result (list files dirs))
+                 ([(p t) (in-directory* scratch)])
+         (cond
+           [(eq? t 'file) (values (+ files 1) dirs)]
+           [(eq? t 'dir)  (values files (+ dirs 1))]
+           [else (values files dirs)]))
+       (list 2 2))
+
+(rm* scratch)

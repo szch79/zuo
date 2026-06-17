@@ -12,9 +12,11 @@
 (require "values.zuo"
          "match.zuo"
          "set.zuo"
-         "syntax-rules.zuo")
+         "syntax-rules.zuo"
+         "for.zuo")
 
 (provide (all-from-out "values.zuo"
                        "match.zuo"
                        "set.zuo"
-                       "syntax-rules.zuo"))
+                       "syntax-rules.zuo"
+                       "for.zuo"))

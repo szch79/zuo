@@ -26,7 +26,8 @@
 (provide match
          match-lambda
          match-define
-         struct-copy)
+         struct-copy
+         compile-pattern)
 
 ;; Introduced identifiers, captured in this module's scope (hygienic).
 (define stx-let (quote-syntax let))

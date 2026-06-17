@@ -1,0 +1,421 @@
+#lang zuo/datum
+
+;; Compiler kernel for the native `for` forms (base-common/for.zuo). A `#lang
+;; zuo`-only feature (wired in via base/main.zuo, not the shared
+;; base-common/main.zuo). Reuses Part 2's `compile-pattern` (from match.zuo) so
+;; the binding LHS accepts any match pattern (symbols, cons, struct, etc.) — the
+;; one cross-feature coupling. `compile-pattern` is a `binding-consumer` helper,
+;; so the `lv` (local-value) the `for` surface macros receive is threaded down to
+;; it here. Emission stays bare-symbol: the expansions reference `set->list`,
+;; `values`, `call-with-values`, `reverse`, `cons`, `ls*`, `stat`, `hash-ref`
+;; etc. as plain symbols resolved against the always-in-scope `#lang zuo` base
+;; bindings at the macro's use site.
+
+(require "match.zuo"        ; compile-pattern
+         "and-or.zuo"       ; cond, else, and, or, when, unless
+         "../pair.zuo"      ; cadr, cddr
+         "../list.zuo"      ; map, andmap
+         "define.zuo"
+         "let.zuo"          ; let, let*
+         "quasiquote.zuo")  ; `/,/,@ in the emitted code
+
+(provide compile-for)
+
+(define (compile-for mode head clauses-form lv)
+  (cond
+    [(eq? mode 'for)      (compile-for-effect head clauses-form lv)]
+    [(eq? mode 'for/list) (compile-for-list   head clauses-form lv)]
+    [(eq? mode 'for/fold) (compile-for-fold   head clauses-form lv)]
+    [(eq? mode 'for/or)   (compile-for-or     head clauses-form lv)]
+    [(eq? mode 'for/and)  (compile-for-and    head clauses-form lv)]
+    [else (error 'for "unknown mode" mode)]))
+
+;; Accept one binding clause optionally followed by trailing clauses:
+;;   #:when EXPR    — skip body if EXPR is #f
+;;   #:unless EXPR  — skip body if EXPR is true
+;;   #:do (DEFN-OR-EXPR ...) — evaluate inline; bindings visible to
+;;                            subsequent clauses and the body
+;; Returns (cons BC CLAUSES) where each CLAUSE is (#:when EXPR),
+;; (#:unless EXPR), or (#:do (FORM ...)) in source order.
+(define (parse-bcs bcs head)
+  (unless (and (list? bcs) (>= (length bcs) 1))
+    (error 'for "expected at least one binding clause" head))
+  (let ([bc (car bcs)])
+    (unless (and (list? bc) (= (length bc) 2))
+      (error 'for "binding clause must be [pat seq]" bc))
+    (let ([pat (car bc)] [seq (cadr bc)])
+      (cond
+        [(multi-value-seq? seq)
+         (unless (and (list? pat)
+                      (andmap symbol? pat)
+                      (= (length pat) (multi-value-arity seq)))
+           (error 'for
+                  "multi-value sequence requires (var ...) of matching arity"
+                  bc))]
+        [else (void)]))
+    (let parse-clauses ([rest (cdr bcs)] [clauses-rev '()])
+      (cond
+        [(null? rest) (cons bc (reverse clauses-rev))]
+        [(and (or (eq? (car rest) '#:when) (eq? (car rest) '#:unless))
+              (pair? (cdr rest)))
+         (parse-clauses (cddr rest)
+                        (cons (list (car rest) (cadr rest)) clauses-rev))]
+        [(and (eq? (car rest) '#:do) (pair? (cdr rest)) (list? (cadr rest)))
+         (parse-clauses (cddr rest)
+                        (cons (list '#:do (cadr rest)) clauses-rev))]
+        [else
+         (error 'for
+                "unexpected token after binding clause; expected #:when EXPR, #:unless EXPR, or #:do (FORM ...)"
+                rest)]))))
+
+;; Walk the parsed clause list and emit code that, per iteration:
+;; evaluates each clause in order; on a #:when/#:unless that fails, calls
+;; SKIP-THUNK to advance with accumulators unchanged; on success of all
+;; clauses, calls RUN-THUNK to evaluate the body. #:do clauses splice
+;; their forms into a `(let () ...)` so internal defines are visible to
+;; subsequent clauses and to the body. SKIP-THUNK and RUN-THUNK may be
+;; invoked multiple times (each #:when / #:unless emits its own skip site)
+;; so they should be cheap to re-emit.
+(define (emit-clauses clauses run-thunk skip-thunk)
+  (cond
+    [(null? clauses) (run-thunk)]
+    [else
+     (let ([c (car clauses)] [rest (cdr clauses)])
+       (cond
+         [(eq? (car c) '#:when)
+          `(cond
+             [,(cadr c) ,(emit-clauses rest run-thunk skip-thunk)]
+             [else ,(skip-thunk)])]
+         [(eq? (car c) '#:unless)
+          `(cond
+             [,(cadr c) ,(skip-thunk)]
+             [else ,(emit-clauses rest run-thunk skip-thunk)])]
+         [(eq? (car c) '#:do)
+          `(let () ,@(cadr c) ,(emit-clauses rest run-thunk skip-thunk))]
+         [else (error 'for "internal: unknown clause" c)]))]))
+
+(define (in-directory? expr)
+  (and (pair? expr)
+       (eq? (car expr) 'in-directory)
+       (let ([n (length (cdr expr))])
+         (and (>= n 0) (<= n 2)))))
+
+(define (in-directory*? expr)
+  (and (pair? expr)
+       (eq? (car expr) 'in-directory*)
+       (let ([n (length (cdr expr))])
+         (and (>= n 0) (<= n 2)))))
+
+;; Multi-value sequence forms: yield N values per step and require an
+;; LHS of N parallel-bound symbols. Currently only `in-directory*`.
+(define (multi-value-seq? seq) (in-directory*? seq))
+
+(define (multi-value-arity seq)
+  (cond
+    [(in-directory*? seq) 2]
+    [else (error 'for "internal: unknown multi-value seq" seq)]))
+
+(define (parse-body body head)
+  (when (null? body)
+    (error 'for "missing body" head))
+  body)
+
+;; Bind the (already-evaluated) value at symbol `v` to the match
+;; pattern `pat`, then evaluate `body`. A pattern mismatch escalates
+;; to a runtime error — `for` is strict, like `let`. `lv` is the
+;; binding-consumer's local-value, threaded to `compile-pattern` so
+;; struct patterns in the LHS resolve their NAME/info.
+(define (bind-pat lv pat v body)
+  (compile-pattern lv pat v body `(error 'for "match failed" ,v)))
+
+(define (in-range? expr)
+  (and (pair? expr)
+       (eq? (car expr) 'in-range)
+       (let ([n (length (cdr expr))])
+         (and (>= n 1) (<= n 3)))))
+
+(define (in-set? expr)
+  (and (pair? expr)
+       (eq? (car expr) 'in-set)
+       (= (length (cdr expr)) 1)))
+
+;; Emit a let-loop driven by either a list cdr-walk or an integer
+;; counter (for `(in-range ...)`).
+;;
+;;   loop-s   : uninterned symbol naming the emitted let-loop; the
+;;              caller's step-fn emits the (loop-s ...) tail calls, so
+;;              binder and call sites must share it. Uninterned so a
+;;              user binding named `loop` can't capture the recursion.
+;;   seq      : the sequence form ((in-range ...) or any list expr)
+;;   pat      : pattern bound to the current element each iteration
+;;   extras   : ((sym init-expr) ...) — extra accumulator state
+;;   term-fn  : (extra-syms) -> expr returned at iteration end
+;;   step-fn  : (advance-expr extra-syms) -> the (loop ...) tail call.
+;;              Decides what the body produces and whether to fold it
+;;              into the accumulator(s) or skip (per #:when / #:unless).
+;;   lv       : binding-consumer local-value, threaded to bind-pat.
+;;
+;; Range bounds are evaluated once in an outer let so the source
+;; expressions aren't re-run each iteration.
+(define (emit-iter lv loop-s seq pat extras term-fn step-fn)
+  ;; `(in-set EXPR)` desugars to a list iteration over `(set->list EXPR)`
+  ;; — `set->list` is a base binding under `#lang zuo`, in scope wherever
+  ;; this expansion lands.
+  (let ([seq (if (in-set? seq) `(set->list ,(cadr seq)) seq)]
+        [extras-syms (map car extras)])
+    (cond
+      [(in-range? seq)
+       (let* ([args (cdr seq)]
+              [n (length args)]
+              [i (string->uninterned-symbol "i")]
+              [from-s (string->uninterned-symbol "from")]
+              [to-s (string->uninterned-symbol "to")]
+              [step-s (string->uninterned-symbol "step")]
+              [outer (cond
+                       [(= n 1) `((,to-s ,(car args)))]
+                       [(= n 2) `((,from-s ,(car args))
+                                  (,to-s ,(cadr args)))]
+                       [else `((,from-s ,(car args))
+                               (,to-s ,(cadr args))
+                               (,step-s ,(car (cddr args))))])]
+              [init (cond [(= n 1) 0] [else from-s])]
+              [test (cond
+                      [(or (= n 1) (= n 2)) `(>= ,i ,to-s)]
+                      [else `(if (< ,step-s 0)
+                                 (<= ,i ,to-s)
+                                 (>= ,i ,to-s))])]
+              [advance (cond
+                         [(or (= n 1) (= n 2)) `(+ ,i 1)]
+                         [else `(+ ,i ,step-s)])])
+         `(let ,outer
+            (let ,loop-s ([,i ,init] ,@extras)
+              (cond
+                [,test ,(term-fn extras-syms)]
+                [else
+                 ,(bind-pat lv pat i
+                            (step-fn advance extras-syms))]))))]
+      [(in-directory? seq)
+       ;; Lazy stack-based DFS, single-value (path only).
+       (let* ([args (cdr seq)]
+              [start-expr (cond [(null? args) "."] [else (car args)])]
+              [follow-expr (cond [(or (null? args) (null? (cdr args))) #t]
+                                 [else (cadr args)])]
+              [start-s (string->uninterned-symbol "start")]
+              [follow? (string->uninterned-symbol "follow?")]
+              [stack (string->uninterned-symbol "stack")]
+              [p (string->uninterned-symbol "p")]
+              [info (string->uninterned-symbol "info")]
+              [t (string->uninterned-symbol "t")]
+              [advance `(if (eq? ,t 'dir)
+                            (append (ls* ,p) (cdr ,stack))
+                            (cdr ,stack))])
+         `(let ([,start-s ,start-expr] [,follow? ,follow-expr])
+            (let ,loop-s ([,stack (list ,start-s)] ,@extras)
+              (cond
+                [(null? ,stack) ,(term-fn extras-syms)]
+                [else
+                 (let* ([,p (car ,stack)]
+                        [,info (stat ,p ,follow?)]
+                        [,t (hash-ref ,info 'type)])
+                   ,(bind-pat lv pat p
+                              (step-fn advance extras-syms)))]))))]
+      [(in-directory*? seq)
+       ;; Lazy stack-based DFS, multi-value (path, type). The user's
+       ;; two pat symbols become the iteration locals directly — no
+       ;; bind-pat, no destructuring.
+       (let* ([args (cdr seq)]
+              [start-expr (cond [(null? args) "."] [else (car args)])]
+              [follow-expr (cond [(or (null? args) (null? (cdr args))) #t]
+                                 [else (cadr args)])]
+              [user-p (car pat)]
+              [user-t (cadr pat)]
+              [start-s (string->uninterned-symbol "start")]
+              [follow? (string->uninterned-symbol "follow?")]
+              [stack (string->uninterned-symbol "stack")]
+              [info (string->uninterned-symbol "info")]
+              [advance `(if (eq? ,user-t 'dir)
+                            (append (ls* ,user-p) (cdr ,stack))
+                            (cdr ,stack))])
+         `(let ([,start-s ,start-expr] [,follow? ,follow-expr])
+            (let ,loop-s ([,stack (list ,start-s)] ,@extras)
+              (cond
+                [(null? ,stack) ,(term-fn extras-syms)]
+                [else
+                 (let* ([,user-p (car ,stack)]
+                        [,info (stat ,user-p ,follow?)]
+                        [,user-t (hash-ref ,info 'type)])
+                   ,(step-fn advance extras-syms))]))))]
+      [else
+       (let ([lst (string->uninterned-symbol "lst")]
+             [v (string->uninterned-symbol "v")])
+         `(let ,loop-s ([,lst ,seq] ,@extras)
+            (cond
+              [(null? ,lst) ,(term-fn extras-syms)]
+              [else
+               (let ([,v (car ,lst)])
+                 ,(bind-pat lv pat v
+                            (step-fn `(cdr ,lst) extras-syms)))])))])))
+
+;; Build the step-fn passed to emit-iter. RUN-FN/SKIP-FN both take a
+;; symbol (the bound advance expression) and produce the corresponding
+;; (loop ...) tail. With no clauses we splice advance directly. With
+;; clauses present we let-bind advance once (so e.g. `ls*` runs once per
+;; iteration) then walk the clause chain via emit-clauses. Needs no `lv`
+;; — bind-pat is called in emit-iter, not here.
+(define (make-step-fn clauses run-fn skip-fn)
+  (lambda (advance extras-syms)
+    (cond
+      [(null? clauses) (run-fn advance extras-syms)]
+      [else
+       (let ([nx (string->uninterned-symbol "nx")])
+         `(let ([,nx ,advance])
+            ,(emit-clauses clauses
+                           (lambda () (run-fn nx extras-syms))
+                           (lambda () (skip-fn nx extras-syms)))))])))
+
+(define (compile-for-effect head clauses-form lv)
+  (let* ([parsed (parse-bcs (car clauses-form) head)]
+         [bc (car parsed)]
+         [clauses (cdr parsed)]
+         [body (parse-body (cdr clauses-form) head)]
+         [pat (car bc)]
+         [seq (cadr bc)]
+         [body-result `(let () ,@body)]
+         [loop-s (string->uninterned-symbol "loop")])
+    (emit-iter lv loop-s seq pat '()
+               (lambda (_xs) '(void))
+               (make-step-fn
+                clauses
+                (lambda (nx _xs) `(begin ,body-result (,loop-s ,nx)))
+                (lambda (nx _xs) `(,loop-s ,nx))))))
+
+(define (compile-for-list head clauses-form lv)
+  (let* ([parsed (parse-bcs (car clauses-form) head)]
+         [bc (car parsed)]
+         [clauses (cdr parsed)]
+         [body (parse-body (cdr clauses-form) head)]
+         [pat (car bc)]
+         [seq (cadr bc)]
+         [body-result `(let () ,@body)]
+         [acc (string->uninterned-symbol "acc")]
+         [loop-s (string->uninterned-symbol "loop")])
+    (emit-iter lv loop-s seq pat `((,acc '()))
+               (lambda (xs) `(reverse ,(car xs)))
+               (make-step-fn
+                clauses
+                (lambda (nx xs) `(,loop-s ,nx (cons ,body-result ,(car xs))))
+                (lambda (nx xs) `(,loop-s ,nx ,(car xs)))))))
+
+;; Parse the acc-clauses portion of a for/fold head. Accepts:
+;;   ((acc init) ...)                 -> returns (cons ((acc init) ...) #f)
+;;   ((acc init) ... #:result EXPR)    -> returns (cons ((acc init) ...) EXPR)
+;;
+;; Multi-accumulator form: the loop body must return as many values as
+;; there are accumulator clauses (via `values`). With no #:result and a
+;; single accumulator the final acc is returned directly; with multiple
+;; accumulators the result is `(values acc1 ... accN)`. With #:result,
+;; that expression is evaluated with all acc-names in scope.
+(define (parse-acc-clauses acc-clauses head)
+  (unless (and (list? acc-clauses) (>= (length acc-clauses) 1))
+    (error 'for/fold "expected accumulator clause(s)" head))
+  (let loop ([rest acc-clauses] [accs-rev '()])
+    (cond
+      [(null? rest)
+       (when (null? accs-rev)
+         (error 'for/fold "expected at least one accumulator clause" head))
+       (cons (reverse accs-rev) #f)]
+      [(eq? (car rest) '#:result)
+       (unless (and (pair? (cdr rest)) (null? (cddr rest)))
+         (error 'for/fold "#:result expects exactly one expression" head))
+       (when (null? accs-rev)
+         (error 'for/fold "expected accumulator clause(s) before #:result" head))
+       (cons (reverse accs-rev) (cadr rest))]
+      [else
+       (let ([clause (car rest)])
+         (unless (and (list? clause)
+                      (= (length clause) 2)
+                      (symbol? (car clause)))
+           (error 'for/fold "accumulator clause must be [name init]" clause))
+         (loop (cdr rest) (cons clause accs-rev)))])))
+
+;; for/or — short-circuit on first non-#f body. No accumulator: the
+;; result is either the first truthy body or #f at iteration end.
+;; A skipped iteration (failed #:when / #:unless) doesn't contribute,
+;; matching the existing for/list filter semantics.
+(define (compile-for-or head clauses-form lv)
+  (let* ([parsed (parse-bcs (car clauses-form) head)]
+         [bc (car parsed)]
+         [clauses (cdr parsed)]
+         [body (parse-body (cdr clauses-form) head)]
+         [pat (car bc)]
+         [seq (cadr bc)]
+         [body-result `(let () ,@body)]
+         [loop-s (string->uninterned-symbol "loop")])
+    (emit-iter lv loop-s seq pat '()
+               (lambda (_xs) #f)
+               (make-step-fn
+                clauses
+                (lambda (nx _xs) `(or ,body-result (,loop-s ,nx)))
+                (lambda (nx _xs) `(,loop-s ,nx))))))
+
+;; for/and — short-circuit on first #f body. Single accumulator
+;; tracking the last truthy body so the form can return that value
+;; (matching Racket); zero iterations and all-skipped iterations
+;; both leave the accumulator at #t.
+(define (compile-for-and head clauses-form lv)
+  (let* ([parsed (parse-bcs (car clauses-form) head)]
+         [bc (car parsed)]
+         [clauses (cdr parsed)]
+         [body (parse-body (cdr clauses-form) head)]
+         [pat (car bc)]
+         [seq (cadr bc)]
+         [body-result `(let () ,@body)]
+         [acc (string->uninterned-symbol "acc")]
+         [loop-s (string->uninterned-symbol "loop")])
+    (emit-iter lv loop-s seq pat `((,acc #t))
+               (lambda (xs) (car xs))
+               (make-step-fn
+                clauses
+                (lambda (nx xs)
+                  (let ([result (string->uninterned-symbol "result")])
+                    `(let ([,result ,body-result])
+                       (cond [(not ,result) #f]
+                             [else (,loop-s ,nx ,result)]))))
+                (lambda (nx xs) `(,loop-s ,nx ,(car xs)))))))
+
+(define (compile-for-fold head clauses-form lv)
+  (unless (and (pair? clauses-form)
+               (pair? (cdr clauses-form))
+               (pair? (cddr clauses-form)))
+    (error 'for/fold "expected ([acc init] ... #:result EXPR?) ([pat seq]) body ..." head))
+  (let* ([parsed (parse-acc-clauses (car clauses-form) head)]
+         [acc-clauses (car parsed)]
+         [result-expr (cdr parsed)]
+         [bcs (cadr clauses-form)]
+         [body (cddr clauses-form)])
+    (parse-body body head)
+    (let* ([parsed (parse-bcs bcs head)]
+           [bc (car parsed)]
+           [clauses (cdr parsed)]
+           [pat (car bc)]
+           [seq (cadr bc)]
+           [body-result `(let () ,@body)]
+           [loop-s (string->uninterned-symbol "loop")])
+      (emit-iter lv loop-s seq pat acc-clauses
+                 (lambda (xs)
+                   (cond
+                     [result-expr result-expr]
+                     [(null? (cdr xs)) (car xs)]
+                     [else `(values ,@xs)]))
+                 (make-step-fn
+                  clauses
+                  (lambda (nx xs)
+                    (cond
+                      [(null? (cdr xs)) `(,loop-s ,nx ,body-result)]
+                      [else
+                       (let ([fresh (map (lambda (_)
+                                           (string->uninterned-symbol "v"))
+                                         xs)])
+                         `(call-with-values (lambda () ,body-result)
+                            (lambda ,fresh (,loop-s ,nx ,@fresh))))]))
+                  (lambda (nx xs) `(,loop-s ,nx ,@xs)))))))

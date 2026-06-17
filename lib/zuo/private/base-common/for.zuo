@@ -1,0 +1,77 @@
+#lang zuo/datum
+
+;; Racket-style `for`, `for/list`, `for/fold`, `for/or`, `for/and` — a `#lang
+;; zuo`-only feature (wired in via base/main.zuo, not the shared
+;; base-common/main.zuo). The five forms are `binding-consumer`s so each receives
+;; `lv` (local-value), threaded through `compile-for` to `compile-pattern` so a
+;; struct pattern in the binding LHS resolves its compile-time NAME/info.
+;;
+;; Single binding clause; sequence is one of:
+;;   - a list expression — `(for ([x lst]) ...)`
+;;   - `(in-range N)` / `(in-range FROM TO)` / `(in-range FROM TO STEP)`
+;;   - `(in-directory)` / `(in-directory PATH)` /
+;;     `(in-directory PATH FOLLOW?)` — lazy DFS yielding paths,
+;;     pre-order matching `fold-files`, including the start path
+;;   - `(in-directory* ...)` — same args, multi-valued
+;;     `(path, type)` per step, where `type ∈ {'file 'dir 'link}`
+;;   - `(in-set EXPR)` — iterate the elements of the set EXPR
+;;     (evaluated once at loop entry; iteration order matches
+;;     `set->list`)
+;;
+;; Single-value sequences accept any match pattern as the LHS. Multi-value
+;; sequences (currently only `in-directory*`) require `[(VAR ...) SEQ]` — a list
+;; of symbols bound in parallel, NOT a match pattern.
+;;
+;; The binding clause may be followed by any number of trailing clauses,
+;; evaluated textually left-to-right per iteration with the LHS bindings in
+;; scope:
+;;   #:when EXPR    — skip body if EXPR is #f
+;;   #:unless EXPR  — skip body if EXPR is true
+;;   #:do (DEFN-OR-EXPR ...) — splice forms inline; internal defines are visible
+;;                            to subsequent clauses and to the body
+;; A failed #:when / #:unless short-circuits — subsequent clauses are not
+;; evaluated, the body is skipped, and the accumulator(s) pass through unchanged.
+;;
+;; for/fold takes one or more accumulator clauses and an optional `#:result EXPR`
+;; evaluated with all acc names in scope. The body must return as many values as
+;; there are accumulators (via `values`). With one accumulator and no #:result the
+;; final acc is returned directly; with multiple accs and no #:result the result
+;; is `(values acc1 ... accN)`.
+;;
+;; for/or returns the first non-#f body, short-circuiting; #f if every
+;; iteration's body was #f or zero iterations ran. for/and returns the last
+;; truthy body, short-circuiting to #f on the first #f body; #t on zero
+;; iterations or all-skipped iterations.
+;;
+;; `values` / `call-with-values` / `set->list` etc. are already base bindings
+;; under `#lang zuo`, so the multi-accumulator and `(in-set …)` expansions find
+;; them at the user's site — no re-export needed (unlike the lib/zuo source).
+
+(require "for-helpers.zuo")
+
+(provide for for/list for/fold for/or for/and)
+
+(define-syntax for
+  (binding-consumer
+   (lambda (stx free-id=? lv name)
+     (compile-for 'for stx (cdr stx) lv))))
+
+(define-syntax for/list
+  (binding-consumer
+   (lambda (stx free-id=? lv name)
+     (compile-for 'for/list stx (cdr stx) lv))))
+
+(define-syntax for/fold
+  (binding-consumer
+   (lambda (stx free-id=? lv name)
+     (compile-for 'for/fold stx (cdr stx) lv))))
+
+(define-syntax for/or
+  (binding-consumer
+   (lambda (stx free-id=? lv name)
+     (compile-for 'for/or stx (cdr stx) lv))))
+
+(define-syntax for/and
+  (binding-consumer
+   (lambda (stx free-id=? lv name)
+     (compile-for 'for/and stx (cdr stx) lv))))
