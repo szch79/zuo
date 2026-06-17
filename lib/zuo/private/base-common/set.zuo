@@ -1,0 +1,83 @@
+#lang zuo/datum
+
+;; Sets for `#lang zuo`: an opaque record wrapping a symbol-keyed `hash`, built
+;; with zuo's primitive `opaque` form (same idiom as values.zuo). A `#lang
+;; zuo`-only feature (wired in via base/main.zuo, not the shared
+;; base-common/main.zuo). Pure runtime — no macros, so no hygiene concerns; the
+;; shared `#lang zuo/datum` source compiles identically under either expander,
+;; but only `#lang zuo` exposes it.
+;;
+;; Module-private uninterned keys make the representation forge-proof: nothing
+;; outside this module can construct a set, destructure one, or extract the
+;; inner table.
+;;
+;; Element constraint inherited from zuo's `hash`: keys must be symbols.
+;;
+;; `equal?` does NOT do value equality on sets — zuo doesn't let us hook into
+;; `equal?` for opaque records, so two sets with the same elements compare
+;; unequal under `equal?`. Use `set-equal?` for value comparison.
+
+(require "and-or.zuo"     ; and, cond, else
+         "../list.zuo"    ; foldl
+         "define.zuo"
+         "let.zuo")
+
+(provide set set? set-add set-remove set-member?
+         set-empty? set-count set->list list->set
+         set-union set-subtract set-equal?)
+
+(define set-key (string->uninterned-symbol "set"))
+(define no-set  (string->uninterned-symbol "no-set"))
+
+(define (set? x)
+  (not (eq? (opaque-ref set-key x no-set) no-set)))
+
+;; Internal helper — never `provide`d. Errors on non-set inputs so type
+;; confusion fails fast.
+(define (set-table s)
+  (let ([t (opaque-ref set-key s no-set)])
+    (cond [(eq? t no-set) (error 'set "not a set" s)]
+          [else t])))
+
+(define (set . elts) (list->set elts))
+
+(define (list->set lst)
+  (opaque set-key
+          (let loop ([lst lst] [h (hash)])
+            (cond [(null? lst) h]
+                  [else (loop (cdr lst) (hash-set h (car lst) #t))]))))
+
+(define (set-add s e)     (opaque set-key (hash-set (set-table s) e #t)))
+(define (set-remove s e)  (opaque set-key (hash-remove (set-table s) e)))
+(define (set-member? s e) (hash-ref (set-table s) e #f))
+(define (set-empty? s)    (= 0 (hash-count (set-table s))))
+(define (set-count s)     (hash-count (set-table s)))
+(define (set->list s)     (hash-keys (set-table s)))
+
+(define (set-union . sets)
+  (cond [(null? sets) (set)]
+        [else
+         (opaque set-key
+                 (foldl (lambda (s h)
+                          (foldl (lambda (k acc) (hash-set acc k #t))
+                                 h
+                                 (hash-keys (set-table s))))
+                        (set-table (car sets))
+                        (cdr sets)))]))
+
+(define (set-subtract s . others)
+  (opaque set-key
+          (foldl (lambda (other h)
+                   (foldl (lambda (k acc) (hash-remove acc k))
+                          h
+                          (hash-keys (set-table other))))
+                 (set-table s)
+                 others)))
+
+(define (set-equal? s1 s2)
+  (and (= (set-count s1) (set-count s2))
+       (let loop ([keys (hash-keys (set-table s1))])
+         (cond [(null? keys) #t]
+               [(hash-ref (set-table s2) (car keys) #f)
+                (loop (cdr keys))]
+               [else #f]))))

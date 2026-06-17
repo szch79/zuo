@@ -10,7 +10,9 @@
 ;; we never compromise the `#lang zuo` design for it). See the plan's design
 ;; principle.
 (require "values.zuo"
-         "match.zuo")
+         "match.zuo"
+         "set.zuo")
 
 (provide (all-from-out "values.zuo"
-                       "match.zuo"))
+                       "match.zuo"
+                       "set.zuo"))

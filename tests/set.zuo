@@ -1,0 +1,64 @@
+#lang zuo
+
+;; `set` and its operations — a `#lang zuo`-only feature (the `set` module is
+;; wired in via base/main.zuo). Sets have no `equal?` value-equality, so tests
+;; go through `set-count`/`set-member?`/`set-equal?` rather than comparing sets
+;; or `set->list` output directly (hash-key order is unspecified).
+
+(require "harness.zuo")
+
+(alert "set")
+
+;; --- construction / predicate ----------------------------------------------
+
+(check (set? (set)) #t)
+(check (set? (set 'a 'b)) #t)
+(check (set? 'a) #f)
+(check (set? (list 'a 'b)) #f)
+(check (set-empty? (set)) #t)
+(check (set-empty? (set 'a)) #f)
+(check (set-count (set)) 0)
+(check (set-count (set 'a 'b 'c)) 3)
+(check (set-count (set 'a 'a 'b)) 2)              ; duplicates collapse
+
+;; --- membership ------------------------------------------------------------
+
+(check (set-member? (set 'a 'b) 'a) #t)
+(check (set-member? (set 'a 'b) 'z) #f)
+(check (set-member? (set) 'a) #f)
+
+;; --- add / remove (functional — originals unchanged) -----------------------
+
+(check (let ([s (set 'a)]) (set-member? (set-add s 'b) 'b)) #t)
+(check (let ([s (set 'a)]) (set-member? s 'b)) #f)            ; add didn't mutate
+(check (let ([s (set 'a 'b)]) (set-member? (set-remove s 'a) 'a)) #f)
+(check (let ([s (set 'a 'b)]) (set-member? (set-remove s 'a) 'b)) #t)
+(check (set-count (set-add (set 'a) 'a)) 1)                   ; re-add is idempotent
+(check (set-count (set-remove (set 'a) 'z)) 1)               ; remove-absent is a no-op
+
+;; --- list->set / set->list round-trip --------------------------------------
+
+(check (set-count (list->set '(a b c a b))) 3)
+(check (set-equal? (list->set (set->list (set 'a 'b 'c))) (set 'a 'b 'c)) #t)
+(check (length (set->list (set 'a 'b 'c))) 3)
+
+;; --- union / subtract ------------------------------------------------------
+
+(check (set-equal? (set-union (set 'a 'b) (set 'b 'c)) (set 'a 'b 'c)) #t)
+(check (set-equal? (set-union) (set)) #t)
+(check (set-equal? (set-union (set 'a)) (set 'a)) #t)
+(check (set-equal? (set-union (set 'a) (set 'b) (set 'c)) (set 'a 'b 'c)) #t)
+(check (set-equal? (set-subtract (set 'a 'b 'c) (set 'b)) (set 'a 'c)) #t)
+(check (set-equal? (set-subtract (set 'a 'b 'c) (set 'a) (set 'c)) (set 'b)) #t)
+(check (set-equal? (set-subtract (set 'a) (set 'a)) (set)) #t)
+
+;; --- set-equal? value comparison -------------------------------------------
+
+(check (set-equal? (set 'a 'b) (set 'b 'a)) #t)              ; order-independent
+(check (set-equal? (set 'a 'b) (set 'a)) #f)
+(check (set-equal? (set) (set)) #t)
+(check (set-equal? (set 'a) (set 'b)) #f)                    ; same count, diff elems
+
+;; --- error case: operating on a non-set ------------------------------------
+
+(check-fail (set-count 'not-a-set) "not a set")

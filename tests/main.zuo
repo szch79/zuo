@@ -31,5 +31,6 @@
 (require "macro-hygienic.zuo")
 (require "values.zuo")
 (require "match.zuo")
+(require "set.zuo")
 
 (alert "... tests passed!")
