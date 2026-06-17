@@ -32,5 +32,6 @@
 (require "values.zuo")
 (require "match.zuo")
 (require "set.zuo")
+(require "syntax-rules.zuo")
 
 (alert "... tests passed!")

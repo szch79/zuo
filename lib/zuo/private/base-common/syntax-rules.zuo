@@ -1,0 +1,70 @@
+#lang zuo/datum
+
+;; R5RS-style `syntax-rules` and `define-syntax-rule` for `#lang zuo`. A `#lang
+;; zuo`-only feature (wired in via base/main.zuo, not the shared
+;; base-common/main.zuo). NOT capture-avoiding — identifiers in templates are
+;; emitted as plain symbols. Macros that introduce fresh bindings should produce
+;; them via `string->uninterned-symbol`.
+;;
+;; A `syntax-rules` expansion emits `(lambda (use-stx) (let ([env (match-pattern
+;; …)]) …))` whose body references `match-pattern`/`splice-ellipsis`/`hash-ref`/
+;; `cons` as BARE symbols at the macro's use site — so those must be base
+;; bindings (match-pattern/splice-ellipsis are re-provided from base/main.zuo).
+
+(require "and-or.zuo"      ; cond, else, and, unless
+         "../pair.zuo"     ; cadr, cddr
+         "../list.zuo"     ; map, for-each
+         "../more.zuo"     ; list?
+         "let.zuo"         ; let, let*
+         "quasiquote.zuo"  ; `/, in the emitted transformer bodies
+         "syntax-helpers.zuo")
+(provide syntax-rules
+         define-syntax-rule
+         match-pattern
+         splice-ellipsis)
+
+(define-syntax syntax-rules
+  (lambda (stx)
+    (unless (and (pair? stx) (pair? (cdr stx)) (list? (cadr stx)))
+      (error 'syntax-rules "bad syntax" stx))
+    (let ([literals (map (lambda (id)
+                           (unless (symbol? id)
+                             (error 'syntax-rules "bad syntax" stx))
+                           id)
+                         (cadr stx))]
+          [rules (cddr stx)])
+      (for-each (lambda (r)
+                  (unless (and (pair? r) (pair? (cdr r)) (null? (cddr r)))
+                    (error 'syntax-rules "bad syntax" stx)))
+                rules)
+      ;; Dispatch on whether the pattern MATCHED (env is a hash or
+      ;; #f), never on the instantiated template's value — a template
+      ;; may legitimately expand to the form #f. `env` as a plain
+      ;; symbol is safe: templates quote user identifiers, so the
+      ;; only `env` references in the emitted code are our own.
+      `(lambda (use-stx)
+         ,(let loop ([rules rules])
+            (cond
+              [(null? rules)
+               `(error 'syntax-rules "no matching rule" use-stx)]
+              [else
+               (let* ([rule (car rules)]
+                      [pat (car rule)]
+                      [tmpl (cadr rule)]
+                      [pvd (analyze-pattern pat literals)])
+                 `(let ([env (match-pattern ',pat use-stx ',literals)])
+                    (if env
+                        ,(compile-template tmpl pvd)
+                        ,(loop (cdr rules)))))]))))))
+
+(define-syntax define-syntax-rule
+  (lambda (stx)
+    (unless (and (pair? stx) (pair? (cdr stx)) (pair? (cddr stx))
+                 (null? (cdr (cddr stx)))
+                 (pair? (cadr stx)))
+      (error 'define-syntax-rule "bad syntax" stx))
+    (let ([head (cadr stx)]
+          [tmpl (car (cddr stx))])
+      `(define-syntax ,(car head)
+         (syntax-rules ()
+           [,head ,tmpl])))))

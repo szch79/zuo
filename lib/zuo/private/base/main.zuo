@@ -11,8 +11,10 @@
 ;; principle.
 (require "values.zuo"
          "match.zuo"
-         "set.zuo")
+         "set.zuo"
+         "syntax-rules.zuo")
 
 (provide (all-from-out "values.zuo"
                        "match.zuo"
-                       "set.zuo"))
+                       "set.zuo"
+                       "syntax-rules.zuo"))

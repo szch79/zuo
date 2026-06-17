@@ -1,0 +1,214 @@
+#lang zuo/datum
+
+;; Pattern-matching and template-instantiation helpers for the non-hygienic
+;; `syntax-rules` (base-common/syntax-rules.zuo). A `#lang zuo`-only feature
+;; (wired in via base/main.zuo, not the shared base-common/main.zuo).
+;;
+;; In `#lang zuo`, identifiers are plain symbols and identifier equality is
+;; `eq?`. There is no scope-set, so `syntax-rules` emitted from here does NOT
+;; provide capture-avoidance — macros that introduce fresh bindings must use
+;; `string->uninterned-symbol` themselves. Bare-symbol emission throughout (no
+;; `quote-syntax`): the templates resolve against the always-in-scope `#lang
+;; zuo` base bindings at the macro's use site.
+
+(require "and-or.zuo"     ; cond, else, and, when, unless
+         "../pair.zuo"    ; cadr, cddr
+         "../list.zuo"    ; foldl, map, for-each, assoc, length, list-ref, append, reverse
+         "../more.zuo"    ; equal?
+         "define.zuo"
+         "let.zuo"        ; let, let*
+         "quasiquote.zuo" ; `/, in compile-template
+         "set.zuo")
+
+(provide match-pattern
+         splice-ellipsis
+         analyze-pattern
+         compile-template)
+
+(define (ellipsis-pair? p)
+  (and (pair? p) (pair? (cdr p))
+       (symbol? (cadr p))
+       (eq? (cadr p) '...)))
+
+(define (match-pattern pat stx literals)
+  ;; `literals` may arrive as a list (from emitted syntax-rules
+  ;; code at user macro sites) — coerce once, then recursive calls
+  ;; pass the already-set form.
+  (let ([literals (if (set? literals) literals (list->set literals))])
+    (cond
+      [(symbol? pat)
+       (cond
+         [(eq? pat '_) (hash)]
+         [(set-member? literals pat)
+          (if (and (symbol? stx) (eq? pat stx)) (hash) #f)]
+         [else (hash pat stx)])]
+      [(ellipsis-pair? pat)
+       (match-ellipsis (car pat) (cddr pat) stx literals)]
+      [(pair? pat)
+       (and (pair? stx)
+            (let ([h1 (match-pattern (car pat) (car stx) literals)])
+              (and h1
+                   (let ([h2 (match-pattern (cdr pat) (cdr stx) literals)])
+                     (and h2 (merge-hashes h1 h2))))))]
+      [(null? pat) (and (null? stx) (hash))]
+      [else
+       (and (equal? pat stx) (hash))])))
+
+(define (merge-hashes h1 h2)
+  (foldl (lambda (k h) (hash-set h k (hash-ref h2 k)))
+         h1
+         (hash-keys h2)))
+
+(define (proper-prefix-length lst)
+  (if (pair? lst)
+      (+ 1 (proper-prefix-length (cdr lst)))
+      0))
+
+(define (split-at-list lst k)
+  (if (= k 0)
+      (cons '() lst)
+      (let ([rec (split-at-list (cdr lst) (- k 1))])
+        (cons (cons (car lst) (car rec)) (cdr rec)))))
+
+(define (match-ellipsis sub-pat tail-pat stx literals)
+  (let ([sub-vars (pattern-var-syms sub-pat literals)]
+        [max-k (proper-prefix-length stx)])
+    (let try-k ([k max-k])
+      (if (< k 0)
+          #f
+          (let* ([split (split-at-list stx k)]
+                 [prefix (car split)]
+                 [rest (cdr split)]
+                 [per-elem (match-each sub-pat prefix literals)])
+            (if per-elem
+                (let ([tail-h (match-pattern tail-pat rest literals)])
+                  (if tail-h
+                      (merge-hashes (pivot-bindings sub-vars per-elem) tail-h)
+                      (try-k (- k 1))))
+                (try-k (- k 1))))))))
+
+(define (match-each sub-pat lst literals)
+  (cond
+    [(null? lst) '()]
+    [else
+     (let ([h (match-pattern sub-pat (car lst) literals)])
+       (and h
+            (let ([rest (match-each sub-pat (cdr lst) literals)])
+              (and rest (cons h rest)))))]))
+
+(define (pivot-bindings vars hashes)
+  (foldl (lambda (v h)
+           (hash-set h v (map (lambda (sub-h) (hash-ref sub-h v)) hashes)))
+         (hash)
+         vars))
+
+(define (pattern-var-syms pat literals)
+  ;; literals is a set (passed from match-ellipsis). Inner accumulator
+  ;; is a set so dedup is O(1); materialize as list at return — order
+  ;; is irrelevant since pivot-bindings only iterates these symbols.
+  (set->list
+   (let loop ([pat pat] [acc (set)])
+     (cond
+       [(symbol? pat)
+        (cond
+          [(eq? pat '_) acc]
+          [(eq? pat '...) acc]
+          [(set-member? literals pat) acc]
+          [else (set-add acc pat)])]
+       [(pair? pat) (loop (cdr pat) (loop (car pat) acc))]
+       [else acc]))))
+
+(define (splice-ellipsis env ellipsis-vars sub-fn tail)
+  (let* ([first-var (car ellipsis-vars)]
+         [first-list (hash-ref env first-var)]
+         [n (length first-list)])
+    (for-each (lambda (v)
+                (let ([lst (hash-ref env v)])
+                  (unless (= (length lst) n)
+                    (error "syntax-rules: mismatched ellipsis lengths"
+                           (list v (length lst) 'vs first-var n)))))
+              (cdr ellipsis-vars))
+    (let loop ([i 0] [acc '()])
+      (if (= i n)
+          (append (reverse acc) tail)
+          (let ([sub-env
+                 (foldl (lambda (v e)
+                          (hash-set e v (list-ref (hash-ref env v) i)))
+                        env
+                        ellipsis-vars)])
+            (loop (+ i 1) (cons (sub-fn sub-env) acc)))))))
+
+(define (analyze-pattern pat literals)
+  (let ([literals (if (set? literals) literals (list->set literals))])
+    (let loop ([pat pat] [depth 0] [acc '()])
+      (cond
+        [(symbol? pat)
+         (cond
+           [(eq? pat '_) acc]
+           [(eq? pat '...) acc]
+           [(set-member? literals pat) acc]
+           [(assoc pat acc)
+            (error "syntax-rules: duplicate pattern variable" pat)]
+           [else (cons (cons pat depth) acc)])]
+        [(ellipsis-pair? pat)
+         (let ([acc1 (loop (car pat) (+ depth 1) acc)])
+           (loop (cddr pat) depth acc1))]
+        [(pair? pat)
+         (let ([acc1 (loop (car pat) depth acc)])
+           (loop (cdr pat) depth acc1))]
+        [else acc]))))
+
+(define (collect-ellipsis-vars tmpl pvd)
+  ;; Inner acc is a set so dedup is O(1); materialize as list at
+  ;; return — order is irrelevant since splice-ellipsis only uses
+  ;; the list for parallel iteration over equal-length lists.
+  (set->list
+   (let loop ([tmpl tmpl] [acc (set)])
+     (cond
+       [(symbol? tmpl)
+        (let ([p (assoc tmpl pvd)])
+          (if (and p (> (cdr p) 0))
+              (set-add acc tmpl)
+              acc))]
+       [(pair? tmpl) (loop (cdr tmpl) (loop (car tmpl) acc))]
+       [else acc]))))
+
+(define (decrement-depths pvd ellipsis-vars)
+  (let ([evars-set (list->set ellipsis-vars)])
+    (map (lambda (p)
+           (if (set-member? evars-set (car p))
+               (cons (car p) (- (cdr p) 1))
+               p))
+         pvd)))
+
+(define (compile-template tmpl pvd)
+  (cond
+    [(symbol? tmpl)
+     (cond
+       [(eq? tmpl '...)
+        (error "syntax-rules: misplaced ellipsis in template")]
+       [else
+        (let ([p (assoc tmpl pvd)])
+          (cond
+            [p
+             (let ([d (cdr p)])
+               (if (= d 0)
+                   `(hash-ref env ',tmpl)
+                   (error "syntax-rules: pattern variable used at insufficient ellipsis depth" tmpl)))]
+            [else `(quote ,tmpl)]))])]
+    [(ellipsis-pair? tmpl)
+     (let* ([sub-tmpl (car tmpl)]
+            [tail-tmpl (cddr tmpl)]
+            [evars (collect-ellipsis-vars sub-tmpl pvd)])
+       (when (null? evars)
+         (error "syntax-rules: ellipsis template has no pattern variables of depth > 0"))
+       (let ([sub-pvd (decrement-depths pvd evars)])
+         `(splice-ellipsis env
+                           ',evars
+                           (lambda (env) ,(compile-template sub-tmpl sub-pvd))
+                           ,(compile-template tail-tmpl pvd))))]
+    [(pair? tmpl)
+     `(cons ,(compile-template (car tmpl) pvd)
+            ,(compile-template (cdr tmpl) pvd))]
+    [(null? tmpl) `'()]
+    [else `',tmpl]))
